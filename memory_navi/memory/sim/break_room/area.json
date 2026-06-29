@@ -1,0 +1,101 @@
+{
+  "area": "break_room",
+  "type": "lounge/office hybrid",
+  "summary": "休息室。机器人初始在房间一侧朝东(+x)。正前方偏左有一个红色矮柜(红门，朝向机器人这侧)；右侧紧邻米色沙发，右后方有绿植，左侧为开阔地面。 办公区已补全：办公椅(center)、桌子(center)、办公桌(center)。",
+  "objects": [
+    {
+      "name": "红色柜子",
+      "spatial": "正前方偏左，红门朝向机器人这侧",
+      "affordance": [
+        "storage"
+      ],
+      "confidence": 0.85,
+      "last_seen": "2026-06-22T15:28:44+00:00",
+      "abs_pose": {
+        "x": 2.294,
+        "y": -0.008,
+        "z": 0.781
+      }
+    },
+    {
+      "name": "沙发",
+      "spatial": "右侧，紧邻",
+      "confidence": 0.9,
+      "last_seen": "2026-06-22T15:28:44+00:00",
+      "abs_pose": {
+        "x": 0.139,
+        "y": -1.414,
+        "z": 0.307
+      }
+    },
+    {
+      "name": "绿植",
+      "spatial": "右后方",
+      "confidence": 0.8,
+      "last_seen": "2026-06-22T15:28:44+00:00"
+    },
+    {
+      "name": "工作台",
+      "abs_pose": {
+        "x": 2.363,
+        "y": -0.321,
+        "z": 0.894
+      },
+      "last_seen": "2026-06-29T11:54:24+00:00"
+    },
+    {
+      "name": "吊灯",
+      "abs_pose": {
+        "x": 1.961,
+        "y": -1.866,
+        "z": 1.646
+      },
+      "last_seen": "2026-06-29T11:54:24+00:00"
+    },
+    {
+      "name": "办公椅",
+      "spatial": "办公区,画面center",
+      "view": {
+        "distance_m": 0.69
+      },
+      "confidence": 1.0,
+      "verified_by": [
+        "qwen3-vl-8b",
+        "depth(代码接地)"
+      ],
+      "last_seen": "2026-06-29T11:57:03+00:00"
+    },
+    {
+      "name": "桌子",
+      "spatial": "办公区,画面center",
+      "view": {
+        "distance_m": 0.69
+      },
+      "confidence": 1.0,
+      "verified_by": [
+        "qwen3-vl-8b",
+        "depth(代码接地)"
+      ],
+      "last_seen": "2026-06-29T11:57:03+00:00"
+    },
+    {
+      "name": "办公桌",
+      "spatial": "办公区,画面center",
+      "view": {
+        "distance_m": 1.57
+      },
+      "confidence": 0.98,
+      "verified_by": [
+        "qwen3-vl-8b",
+        "depth(代码接地)"
+      ],
+      "last_seen": "2026-06-29T11:57:03+00:00"
+    }
+  ],
+  "view_pose": {
+    "x": 4.857,
+    "y": -0.229,
+    "yaw": 174.3
+  },
+  "observed_at": "2026-06-29T11:57:03+00:00"
+}

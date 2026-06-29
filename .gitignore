@@ -1,0 +1,12 @@
+academic-research-skills/
+__pycache__/
+*.pyc
+Report/__pycache__/
+.webui_secret_key
+
+# 大文件不推 GitHub
+paper/*.pdf
+memory_navi/ros-mcp-server/examples/*/images/*.gif
+memory_navi/ros-mcp-server/examples/*/images/*.png
+memory_navi/ros-mcp-server/docs/images/*.gif
+*.gif

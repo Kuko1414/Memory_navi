@@ -1,0 +1,12 @@
+{
+  "commands": {
+    "report": {
+      "description": "生成指定时间区间的工作总结报告。用法: /report 1.21-3.1 [md|html] [CN/EN], 要求: .....",
+      "prompt": "执行 .claude/commands/report.md 中定义的报告生成流程。用户输入: {$1}"
+    },
+    "build_workspace": {
+      "description": "新建 ROS2 工作区脚手架。用法: /build_workspace <项目路径> [项目描述]",
+      "prompt": "执行 .claude/commands/build_workspace.md 中定义的工作区创建流程。用户输入: {$1}"
+    }
+  }
+}

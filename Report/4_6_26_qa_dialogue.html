@@ -1,0 +1,739 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>VLM 本地空间智能体 — 学术质疑与设计对话</title>
+  <style>
+    :root {
+      --q-color: #1a56db;
+      --q-bg: #e8f0fe;
+      --a-color: #059669;
+      --a-bg: #ecfdf5;
+      --reflect-color: #d97706;
+      --reflect-bg: #fffbeb;
+      --gray-50: #f9fafb;
+      --gray-100: #f3f4f6;
+      --gray-200: #e5e7eb;
+      --gray-300: #d1d5db;
+      --gray-500: #6b7280;
+      --gray-700: #374151;
+      --gray-900: #111827;
+      --radius: 8px;
+      --shadow: 0 1px 3px rgba(0,0,0,0.08), 0 1px 2px rgba(0,0,0,0.06);
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", -apple-system, BlinkMacSystemFont, sans-serif;
+      max-width: 960px;
+      margin: 0 auto;
+      padding: 2rem 1.5rem 4rem;
+      color: var(--gray-900);
+      line-height: 1.8;
+      background: #fff;
+    }
+
+    h1 {
+      font-size: 1.8rem;
+      font-weight: 800;
+      border-bottom: 3px solid var(--q-color);
+      padding-bottom: 0.6rem;
+      margin: 0.5rem 0 0.3rem;
+    }
+
+    h2 {
+      font-size: 1.3rem;
+      font-weight: 700;
+      border-left: 4px solid var(--q-color);
+      padding-left: 0.8rem;
+      margin: 2.5rem 0 1rem;
+    }
+
+    h3 {
+      font-size: 1.05rem;
+      font-weight: 600;
+      margin: 1.8rem 0 0.6rem;
+      color: var(--gray-700);
+    }
+
+    p { margin: 0.6rem 0; }
+
+    .report-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 1rem 2.5rem;
+      padding: 0.8rem 1rem;
+      background: var(--gray-50);
+      border-radius: var(--radius);
+      font-size: 0.9rem;
+      color: var(--gray-500);
+      margin-bottom: 1.5rem;
+    }
+
+    .report-meta span strong { color: var(--gray-700); }
+
+    /* ========== 问答块 ========== */
+    .qa-block {
+      margin: 1.2rem 0;
+      border-radius: var(--radius);
+      overflow: hidden;
+      box-shadow: var(--shadow);
+    }
+
+    .question {
+      background: var(--q-bg);
+      border-left: 5px solid var(--q-color);
+      padding: 1rem 1.2rem;
+    }
+
+    .question .q-label {
+      font-size: 0.8em;
+      font-weight: 800;
+      text-transform: uppercase;
+      color: var(--q-color);
+      letter-spacing: 0.05em;
+      margin-bottom: 0.3rem;
+    }
+
+    .question .q-text {
+      font-weight: 600;
+      font-size: 0.98em;
+    }
+
+    .answer {
+      background: var(--a-bg);
+      border-left: 5px solid var(--a-color);
+      padding: 1rem 1.2rem;
+    }
+
+    .answer .a-label {
+      font-size: 0.8em;
+      font-weight: 800;
+      text-transform: uppercase;
+      color: var(--a-color);
+      letter-spacing: 0.05em;
+      margin-bottom: 0.3rem;
+    }
+
+    .answer .a-text {
+      font-size: 0.95em;
+    }
+
+    .reflect {
+      background: var(--reflect-bg);
+      border-left: 5px solid var(--reflect-color);
+      padding: 0.8rem 1.2rem;
+      font-size: 0.9em;
+    }
+
+    .reflect .r-label {
+      font-size: 0.78em;
+      font-weight: 800;
+      text-transform: uppercase;
+      color: var(--reflect-color);
+      letter-spacing: 0.05em;
+      margin-bottom: 0.2rem;
+    }
+
+    /* ========== 摘要标签 ========== */
+    .tag {
+      display: inline-block;
+      padding: 2px 10px;
+      border-radius: 12px;
+      font-size: 0.78em;
+      font-weight: 600;
+      margin-right: 0.3rem;
+    }
+    .tag-def  { background: #fef3c7; color: #92400e; }
+    .tag-arch { background: #dbeafe; color: #1e40af; }
+    .tag-eval { background: #fce7f3; color: #9d174d; }
+    .tag-feas { background: #d1fae5; color: #065f46; }
+    .tag-risk { background: #fee2e2; color: #991b1b; }
+
+    /* ========== 可折叠面板 ========== */
+    details {
+      margin: 0.5rem 0 0.8rem;
+      border: 1px solid var(--gray-200);
+      border-radius: var(--radius);
+      padding: 0.7rem 1rem;
+      background: var(--gray-50);
+    }
+    details summary {
+      cursor: pointer;
+      font-weight: 700;
+      font-size: 0.95em;
+      user-select: none;
+      outline: none;
+      list-style: none;
+    }
+    details summary::-webkit-details-marker { display: none; }
+    details summary::before { content: "▸ "; color: var(--q-color); }
+    details[open] summary::before { content: "▾ "; }
+    details .detail-content { padding: 0.6rem 0 0.3rem 1.2rem; }
+
+    /* ========== 导航目录 ========== */
+    .toc {
+      background: var(--gray-50);
+      border-radius: var(--radius);
+      padding: 1rem 1.3rem;
+      margin: 1rem 0 2rem;
+    }
+    .toc h3 { margin-top: 0; }
+    .toc ol { padding-left: 1.5rem; }
+    .toc li { margin: 0.3rem 0; font-size: 0.93em; }
+    .toc a { color: var(--q-color); text-decoration: none; }
+    .toc a:hover { text-decoration: underline; }
+
+    /* ========== 引用 ========== */
+    blockquote {
+      border-left: 3px solid var(--gray-300);
+      padding: 0.4rem 1rem;
+      margin: 0.8rem 0;
+      color: var(--gray-700);
+      background: var(--gray-50);
+      border-radius: 0 var(--radius) var(--radius) 0;
+      font-size: 0.93em;
+    }
+
+    /* ========== 响应式 ========== */
+    @media (max-width: 700px) {
+      body { padding: 1rem 0.8rem; }
+      h1 { font-size: 1.4rem; }
+    }
+
+    @media print {
+      body { max-width: 100%; color: #000; }
+      .qa-block { break-inside: avoid; box-shadow: none; border: 1px solid #ccc; }
+    }
+  </style>
+</head>
+<body>
+
+<h1>🔬 VLM 本地空间智能体 — 学术质疑对话录</h1>
+
+<div class="report-meta">
+  <span>📅 <strong>对话日期：</strong>2026年6月4日</span>
+  <span>📝 <strong>用途：</strong>后续自我审视与方案打磨</span>
+  <span>🔖 <strong>版本：</strong>v1.0</span>
+</div>
+
+<!-- ================================================================
+     目录
+     ================================================================ -->
+<div class="toc">
+  <h3>📑 对话结构</h3>
+  <ol>
+    <li><a href="#round1">第一轮 — 核心定义与架构基础（Q1–Q10）</a></li>
+    <li><a href="#round1a">第一轮回应 — 用户的系统性回答</a></li>
+    <li><a href="#round2">第二轮 — 实现层缺口深挖（Q11–Q17）</a></li>
+    <li><a href="#round2a">第二轮回应 — 用户的系统性回答</a></li>
+    <li><a href="#round3">第三轮 — 细化追问与学术定位（Q18–Q21）</a></li>
+    <li><a href="#round3a">第三轮回应 — 用户的系统性回答</a></li>
+  </ol>
+</div>
+
+<blockquote>
+  <strong>💡 使用建议：</strong>每次重新审视这个文件时，选一轮对话，先遮住「你的回答」部分，
+  自己重新回答一遍。然后对比原始回答，你会发现思路的演化。每条问题下方的
+  <span style="color:var(--reflect-color);">🪞 自我审视提示</span> 是供你未来反复拷问自己的。
+</blockquote>
+
+<!-- ================================================================
+     第一轮 — Q1–Q10
+     ================================================================ -->
+<h2 id="round1">第一轮：核心定义与架构基础（Q1–Q10）</h2>
+
+<p>本轮目标：压榨出精确的定义。你的 VLM 空间智能体到底是什么，不是什么。</p>
+
+<!-- Q1 -->
+<div class="qa-block">
+  <div class="question">
+    <div class="q-label">🔴 Q1 · <span class="tag tag-def">定义</span></div>
+    <div class="q-text">你说的"空间理解"到底是什么？空间 Token、语义拓扑、路径信息——这三者的关系是什么？数据结构是什么？</div>
+  </div>
+  <div class="answer">
+    <div class="a-label">✅ 你的回答</div>
+    <div class="a-text">
+      <p><strong>空间 Token：</strong>把空间里的感知信息记录下来——房子里有多少区域、多少物体，它们的坐标、视角、置信度、名称等。这些信息存储在 JSON 文件中，以 Token 形式让大模型下轮任务参考。</p>
+      <p><strong>语义拓扑：</strong>一个理解性的结构，用于处理复杂任务。例如「机器人如何去厨房？【房间A → 客厅 → 走廊 → 厨房】」，这是全局信息。房间内也有拓扑语义，例如「房间门口看有【桌子，15°，3m±0.5m】」。</p>
+      <p><strong>三者关系：</strong>JSON Token 是底层存储，语义拓扑是上层理解结构，路径信息从拓扑中派生。可以跨任务复用，比如「从房间 A 拿杯子去厨房接水」可以先参考拓扑走到厨房，再让 VLM 识别水槽。</p>
+    </div>
+  </div>
+  <div class="reflect">
+    <div class="r-label">🪞 自我审视提示</div>
+    <p>你现在能把 JSON Token 的 schema 写出来吗？如果写不出来——"空间理解"就还是模糊的。试着列出 JSON 文件的顶层 key。</p>
+  </div>
+</div>
+
+<!-- Q2 -->
+<div class="qa-block">
+  <div class="question">
+    <div class="q-label">🔴 Q2 · <span class="tag tag-arch">架构</span></div>
+    <div class="q-text">VLA 的"执行"和 VLM 的"理解"，在你的系统里边界在哪里？谁生成最终的 motor command？</div>
+  </div>
+  <div class="answer">
+    <div class="a-label">✅ 你的回答</div>
+    <div class="a-text">
+      <p><strong>VLM 负责理解和规划，不直接发 cmd_vel。</strong>VLM 拆解任务为子任务 → 交给响应更快的本地小模型执行。VLM 控制 control.py 发速度指令，但 Qwen2-VL 实时判断前方不可走时，VLM 必须叫停。</p>
+      <p><strong>与 VLA 的本质区别：</strong>VLA 只知道"能不能走"——传感器告诉它不通，下次就不走。但 VLA 不知道 <em>为什么</em> 不能走，"下次还能不能走""万一以后通了"——这些它不会回答。而 VLM 可以——通了就走，堵了就绕，知道原因。</p>
+      <p><strong>控制是简单的，什么时候控制、怎么控制、要不要控制——VLM 比 VLA 更强。</strong></p>
+    </div>
+  </div>
+  <div class="reflect">
+    <div class="r-label">🪞 自我审视提示</div>
+    <p>这个边界定义是你整个系统最核心的 claim。将来如果有人问你"这跟 VLA 有什么区别"，你能用一句话说清楚吗？试着现在就写出来。</p>
+  </div>
+</div>
+
+<!-- Q3 -->
+<div class="qa-block">
+  <div class="question">
+    <div class="q-label">🔴 Q3 · <span class="tag tag-eval">可证伪性</span></div>
+    <div class="q-text">"渐进式空间理解，反过来增强下一次任务"——增强的对象是什么？反馈信号从哪来？这个 claim 怎么被证伪？</div>
+  </div>
+  <div class="answer">
+    <div class="a-label">✅ 你的回答</div>
+    <div class="a-text">
+      <p><strong>增强机制：</strong>首次执行不一定高效，但记录下不同房间的拓扑关系和物体坐标后，下一次可以直接参考 JSON，远比重新探索快。机器人在某处绊倒过，下次会小心避开。</p>
+      <p><strong>证伪方式：</strong>直接告诉机器人具体坐标让它在已知环境中执行——如果做到，说明标定/理解没问题；如果还是做不到，说明空间理解的部分做得不到位。</p>
+    </div>
+  </div>
+  <div class="reflect">
+    <div class="r-label">🪞 自我审视提示</div>
+    <p>你的证伪逻辑是「可定位但不可导航 → 空间理解有问题」。这是必要条件测试——但不是充分条件。能证明你的方法"理解得更好"而不是"记住了坐标"吗？你需要一个「未见过的空间推理任务」来区隔这两者。</p>
+  </div>
+</div>
+
+<!-- Q4 -->
+<div class="qa-block">
+  <div class="question">
+    <div class="q-label">🔴 Q4 · <span class="tag tag-arch">表征学习</span></div>
+    <div class="q-text">空间 Token 是偏 CLIP 语义 embedding（选项 A）还是偏几何重建（选项 B）？两者融合在哪一层做？</div>
+  </div>
+  <div class="answer">
+    <div class="a-label">✅ 你的回答</div>
+    <div class="a-text">偏向选项 A（CLIP/SigLIP embedding）。但调用 API 的模型大多闭源，所以空间理解部分会交给一个小型本地 AI，利用 Token 规划合理道路，再交给 VLM 审阅，通过了才执行。</div>
+  </div>
+  <div class="reflect">
+    <div class="r-label">🪞 自我审视提示</div>
+    <p>选 A 就意味着接受了 CLIP 空间精度差的代价（CLIP 经常混淆左右）。你打算用什么机制弥补几何精度的缺失？LiDAR 输入？深度图？还是纯靠多次观测投票？这需要一个明确的技术方案。</p>
+  </div>
+</div>
+
+<!-- Q5 -->
+<div class="qa-block">
+  <div class="question">
+    <div class="q-label">🔴 Q5 · <span class="tag tag-def">定义</span></div>
+    <div class="q-text">语义拓扑跟经典 SLAM 拓扑图的本质区别是什么？节点和边各包含什么信息？VLM 是自由生成还是 structured output？</div>
+  </div>
+  <div class="answer">
+    <div class="a-label">✅ 你的回答</div>
+    <div class="a-text">已在前述回答中覆盖。语义拓扑包含全局连通性（房间→走廊→房间）和局部空间关系（门、物体方位/距离）。</div>
+  </div>
+  <div class="reflect">
+    <div class="r-label">🪞 自我审视提示</div>
+    <p>你现在没给出形式化 schema。一个审稿人会要求你写出节点和边的数据结构。建议打开一个空白 JSON，写出至少 3 个节点和 2 条边——这是你做完最小原型前必须完成的任务。</p>
+  </div>
+</div>
+
+<!-- Q6 -->
+<div class="qa-block">
+  <div class="question">
+    <div class="q-label">🔴 Q6 · <span class="tag tag-arch">架构</span></div>
+    <div class="q-text">本地小模型 + API 大模型的协作模式是什么？谁说了算？切换标准是什么？</div>
+  </div>
+  <div class="answer">
+    <div class="a-label">✅ 你的回答</div>
+    <div class="a-text">
+      <p><strong>本地智慧模型说了算。</strong>API 调用偏慢，更倾向处理泛化内容（识别空间里有什么、为什么不能通行）。如果全程交给 API，多轮交互延迟会爆炸。</p>
+      <p><strong>切换条件：</strong>如果 Qwen2.5-VL-3B 判断失败，把图像传给 API 让它帮助理解。日常不需要 API。</p>
+    </div>
+  </div>
+  <div class="reflect">
+    <div class="r-label">🪞 自我审视提示</div>
+    <p>"判断失败"的准确定义是什么？是 Qwen 输出置信度低于阈值？是连续 N 步动作被否决？还是语义拓扑中出现未知节点类型？你需要一个可编程的触发条件，不是"感觉搞不定就打 API"。</p>
+  </div>
+</div>
+
+<!-- Q7 -->
+<div class="qa-block">
+  <div class="question">
+    <div class="q-label">🔴 Q7 · <span class="tag tag-arch">记忆系统</span></div>
+    <div class="q-text">记忆的 Token 化存储到底解决什么问题？A（全帧）、B（embedding）、C（拓扑更新）——你选哪个？</div>
+  </div>
+  <div class="answer">
+    <div class="a-label">✅ 你的回答</div>
+    <div class="a-text">倾向于 A 但不是存图像，而是在下一轮任务中同时传入语义信息 + 当前图像。本地模型不需要阅览全部历史信息——只获取结构化 JSON 中的相关条目即可。</div>
+  </div>
+  <div class="reflect">
+    <div class="r-label">🪞 自我审视提示</div>
+    <p>你实际选的是混合方案：结构化 JSON + 当前帧。这意味着「检索什么」的决策权在 Orchestrator。Orchestrator 怎么知道「去厨房」时需要查哪些历史 JSON 条目？用坐标？用语义标签？用 task embedding？这个检索策略是你记忆系统的核心。</p>
+  </div>
+</div>
+
+<!-- Q8 -->
+<div class="qa-block">
+  <div class="question">
+    <div class="q-label">🔴 Q8 · <span class="tag tag-feas">可行性</span></div>
+    <div class="q-text">你打算用什么来训练/微调本地 VLM？frozen weights、RAG、LoRA、Skill 脚本、在线 RL——各自有根本性 trade-off，你选哪个？</div>
+  </div>
+  <div class="answer">
+    <div class="a-label">✅ 你的回答</div>
+    <div class="a-text">承认这是弱项，需要进一步研究。后续讨论中明确了需要微调（LoRA + RL），记录成功轨迹作为优化数据。</div>
+  </div>
+  <div class="reflect">
+    <div class="r-label">🪞 自我审视提示</div>
+    <p>你现在已明确了方案（LoRA + GRPO RL），但还没跑起来。在你的最小原型中，先不需要微调——用 frozen Qwen + 结构化 JSON memory 验证核心假设。微调是 Month 2 的事。</p>
+  </div>
+</div>
+
+<!-- Q9 -->
+<div class="qa-block">
+  <div class="question">
+    <div class="q-label">🔴 Q9 · <span class="tag tag-eval">评价</span></div>
+    <div class="q-text">"渐进式空间理解"如何量化衡量？你的 baseline 是什么？指标选哪些？</div>
+  </div>
+  <div class="answer">
+    <div class="a-label">✅ 你的回答</div>
+    <div class="a-text">
+      <p><strong>需要跟传统 Navigation 对比：</strong>初始状态比不过传统算法，但随着任务的长程化、复杂度和路程增加，会逐渐胜任。</p>
+      <p><strong>也需要跟纯 VLM 对比：</strong>比的是学习能力和全局统筹——纯 Gemini VLM 理解图像就要 3-5s，未经优化塞入图像会导致上下文爆炸和幻觉。比的是多轮任务后的空间理解清晰度和单轮执行效率。</p>
+      <p><strong>指标：</strong>时间 / 成功率 / 识别正确度 / 重规划次数 / VLM 理解能力（提问空间中可能不存在的东西）/ Sub-Goal Completion。</p>
+    </div>
+  </div>
+  <div class="reflect">
+    <div class="r-label">🪞 自我审视提示</div>
+    <p>"VLM 理解能力"这个指标很主观——你怎么量化它？建议用空间 QA 任务（「浴室在厨房的哪个方向」→ 正确/错误）做成一个固定测试集，每轮跑一遍。这比「感觉更懂了」有说服力得多。</p>
+  </div>
+</div>
+
+<!-- Q10 -->
+<div class="qa-block">
+  <div class="question">
+    <div class="q-label">🔴 Q10 · <span class="tag tag-feas">最小实验</span></div>
+    <div class="q-text">最小的可验证实验是什么？在搭完整架构前，怎么验证核心假设？</div>
+  </div>
+  <div class="answer">
+    <div class="a-label">✅ 你的回答</div>
+    <div class="a-text">接受实验框架：真实小车在 1-2 个房间，相同 5 个导航任务重复 10 轮，测量每轮 completion time / 碰撞次数 / 重规划次数。对比 Baseline（无记忆 Gemini）vs 实验组（空间 Token + 语义拓扑）。后续细化场景为「房间 A 拿衣服 → 浴室 B 洗 → 来回直到 A 空」。</div>
+  </div>
+  <div class="reflect">
+    <div class="r-label">🪞 自我审视提示</div>
+    <p>这个实验已经够好。唯一要注意的是：你需要确认 Round 1 的实验组和 Baseline 起点公平——实验组 Round 1 也没有 JSON 记忆。如果 Round 1 就比 Baseline 好，那说明有什么你没控制住的变量。</p>
+  </div>
+</div>
+
+<!-- ================================================================
+     第二轮 — Q11–Q17
+     ================================================================ -->
+<h2 id="round2">第二轮：实现层缺口深挖（Q11–Q17）</h2>
+
+<p>本轮目标：逼出具体的仲裁规则、数据结构、错误纠正机制。</p>
+
+<!-- Q11 -->
+<div class="qa-block">
+  <div class="question">
+    <div class="q-label">🔴 Q11 · <span class="tag tag-arch">架构</span></div>
+    <div class="q-text">VLM 规划 vs Qwen2-VL 执行——仲裁冲突怎么解决？谁听谁的？出错后谁负责？</div>
+  </div>
+  <div class="answer">
+    <div class="a-label">✅ 你的回答</div>
+    <div class="a-text">
+      <p><strong>听本地模型的。</strong>VLM 只根据图片和部分信息参考，本地模型能结合 Token、语义、图像和其他模型的建议多方面判断，所以更需要做 RL 和部分微调。</p>
+      <p><strong>出了事故，本地模型负责。</strong>如果发生了碰撞——为什么其他模型没识别出这边不能走？VLM 看不到本地模型也应该能看到。如果发生了质疑，让其他模型也重新判断。</p>
+      <p><strong>仲裁分级：</strong></p>
+      <ul>
+        <li><strong>Level 0：</strong>LiDAR &lt; 0.15m → 无条件急停（不经过任何模型）</li>
+        <li><strong>Level 1：</strong>Qwen 说不能走，VLM 说能走 → 需要其他模型判断：如果能走就走，如果不能走就否决 VLM 并给出理由</li>
+        <li><strong>Level 2：</strong>VLM 只提供复杂理解信息给 Qwen，不会直接更改路径，需要多模型判断</li>
+      </ul>
+    </div>
+  </div>
+  <div class="reflect">
+    <div class="r-label">🪞 自我审视提示</div>
+    <p>你的仲裁规则已经很清晰了。但「其他模型判断」——你有几个模型？如果只有 Gemini + Qwen 两个，1:1 平票听谁的？这是你后来引入 Orchestrator 的关键原因。当你将来搭系统时，确保这个仲裁器的代码逻辑清晰可审计——它是整个系统的安全命门。</p>
+  </div>
+</div>
+
+<!-- Q12 -->
+<div class="qa-block">
+  <div class="question">
+    <div class="q-label">🔴 Q12 · <span class="tag tag-def">数据</span></div>
+    <div class="q-text">JSON 空间 Token ——你到底存什么？给谁看？上下文窗口满了怎么裁剪？</div>
+  </div>
+  <div class="answer">
+    <div class="a-label">✅ 你的回答</div>
+    <div class="a-text">
+      <p><strong>不是全量喂给 Qwen。</strong>Qwen 收到的只是「左侧 30-45 度可以走多少米，走到那里后头朝向哪里」，以及「在哪些像素区域内规划」。Qwen 通过像素辐射到真实坐标即可。</p>
+      <p>信息存在 JSON 中，但 Qwen 没必要全部阅览——如果出现碰撞，说明小模型对传感器数据和真实距离感知有问题，需要训练它。</p>
+    </div>
+  </div>
+  <div class="reflect">
+    <div class="r-label">🪞 自我审视提示</div>
+    <p>你把问题从「怎么存」转移到了「给每个模型看什么」——这是对的。但你需要一个明确的 <strong>prompt 组装模块</strong>：不同模型、不同任务类型 → 不同的 prompt 模板 + 不同的 JSON 子集。这个模块可能是你系统中代码量最大但最不 sexy 的部分——别跳过它。</p>
+  </div>
+</div>
+
+<!-- Q13 -->
+<div class="qa-block">
+  <div class="question">
+    <div class="q-label">🔴 Q13 · <span class="tag tag-feas">冷启动</span></div>
+    <div class="q-text">语义拓扑——谁来建？第一次进入新环境怎么办？</div>
+  </div>
+  <div class="answer">
+    <div class="a-label">✅ 你的回答</div>
+    <div class="a-text">
+      <p>取决于用户 prompt。用户信息过少时，VLM 主动探索——边走边建信息。如果用户指定了方向，大模型根据提示去看。利用 RGB + Depth + LiDAR + API VLM 多模判断：</p>
+      <ul>
+        <li>检测到可通行且 RGB 像门 → 先标记，置信度低</li>
+        <li>走进去发现确实是厨房门 → 置信度提高</li>
+        <li>发现不是门是画框 → 调用更强大的 VLM 识别再标记</li>
+      </ul>
+      <p>总比站在原地好。</p>
+    </div>
+  </div>
+  <div class="reflect">
+    <div class="r-label">🪞 自我审视提示</div>
+    <p>"总比站在原地好"——这是一个很好的工程哲学。但你需要在代码里定义「探索行为」的边界：机器人自己探索到什么程度？会不会探索到没电？你需要一个探索预算（最大探索步数/时间/距离），超了就回退。</p>
+  </div>
+</div>
+
+<!-- Q14 -->
+<div class="qa-block">
+  <div class="question">
+    <div class="q-label">🔴 Q14 · <span class="tag tag-risk">风险</span></div>
+    <div class="q-text">你有没有考虑过错误传播问题？Garbage In → Garbage Forever？</div>
+  </div>
+  <div class="answer">
+    <div class="a-label">✅ 你的回答</div>
+    <div class="a-text">
+      <p>小模型阅览数据时先判断对不对，去掉过大扰动。语义拓扑不涉及精度——如果路上发现快撞了，速度转向绕开，从 odom 重新读可通行区域。</p>
+      <p><strong>陈旧信息更新：</strong>如果一个地方之前可以通行但新增了障碍物，用 Function Call 工具修改 JSON 信息。置信度一般不会降低，除非空间在再次到达时发生了变化。</p>
+    </div>
+  </div>
+  <div class="reflect">
+    <div class="r-label">🪞 自我审视提示</div>
+    <p>"置信度一般不会降低，除非空间在再次到达时发生了变化"——这个策略有风险。如果传感器在某次观测中出错（反光、遮挡），错误信息会永久保留。你需要一个时间衰减机制（超过 N 小时未确认的信息降低置信度）或者周期性重新观测验证。</p>
+  </div>
+</div>
+
+<!-- Q15 -->
+<div class="qa-block">
+  <div class="question">
+    <div class="q-label">🔴 Q15 · <span class="tag tag-feas">训练</span></div>
+    <div class="q-text">你到底要不要微调模型？如果要做，数据量、算力、loss function 是什么？</div>
+  </div>
+  <div class="answer">
+    <div class="a-label">✅ 你的回答</div>
+    <div class="a-text">
+      <p>确认需要微调。记录走得通的路径，标记优秀信息作为优化数据。过程循序渐进，直到成功率到达阈值。</p>
+      <p>对 Loss 需要学习了解。后续讨论中明确了多任务 Loss 结构：L_navigation + α·L_spatial + β·L_safety。</p>
+    </div>
+  </div>
+  <div class="reflect">
+    <div class="r-label">🪞 自我审视提示</div>
+    <p>BC warmup → GRPO RL 是正确路径。但在仿真预训练时，你需要确认 reward function 的设计不会引入 reward hacking。比如「时间惩罚 -0.01/步」可能导致机器人选择原地不动而不是绕路——仔细调权重。</p>
+  </div>
+</div>
+
+<!-- Q16 -->
+<div class="qa-block">
+  <div class="question">
+    <div class="q-label">🔴 Q16 · <span class="tag tag-eval">定位</span></div>
+    <div class="q-text">你的系统到底比别人强在哪？Baseline 1-4 分别是什么？请用一句话说清楚。</div>
+  </div>
+  <div class="answer">
+    <div class="a-label">✅ 你的回答</div>
+    <div class="a-text">
+      <p>Baseline 1: 纯 Gemini VLM（无记忆）<br>
+      Baseline 2: Gemini VLM + 历史 prompt 拼接（有记忆，无结构化）<br>
+      Baseline 3: 传统 Nav Stack + 语义 SLAM（有拓扑，无 VLM 理解）<br>
+      Baseline 4: VLA / OpenVLA / Octo（有学习，无显式空间理解）</p>
+      <p><strong>你的系统取 Baseline 2 和 3 的交集，加上小模型加速。贡献在于结构化空间记忆 + 语义拓扑的组合。</strong></p>
+    </div>
+  </div>
+  <div class="reflect">
+    <div class="r-label">🪞 自我审视提示</div>
+    <p>你的系统是 Baseline 2 + 3 的融合。那你要在实验中证明：融合后的效果 > 2 和 3 的线性加和——也就是 1+1>2。否则审稿人会说「你只是把两个已有方法拼在一起」。你需要一个消融实验来证明语义拓扑 + JSON Token 之间存在协同效应。</p>
+  </div>
+</div>
+
+<!-- Q17 -->
+<div class="qa-block">
+  <div class="question">
+    <div class="q-label">🔴 Q17 · <span class="tag tag-feas">最小原型</span></div>
+    <div class="q-text">一周内能跑起来的最小原型是什么？能验证什么核心假设？</div>
+  </div>
+  <div class="answer">
+    <div class="a-label">✅ 你的回答</div>
+    <div class="a-text">
+      <p>建立最小拓扑结构——两个房间位于走廊两侧。A→B→A 反复取送。具体场景：「去房间 A 拿衣服 → 浴室 B 洗 → 重复直到 A 没有衣服」。验证核心假设：「JSON 空间记忆能显著减少 VLM 推理次数和导航时间」。</p>
+    </div>
+  </div>
+  <div class="reflect">
+    <div class="r-label">🪞 自我审视提示</div>
+    <p>在「A 没衣服」的终点条件上——你需要一个视觉判断（VLM 确认「架子上没有衣服了」）。这也是你空间理解能力的一个子测试。把这个判断的准确率也记录下来。</p>
+  </div>
+</div>
+
+<!-- ================================================================
+     第三轮 — Q18–Q21
+     ================================================================ -->
+<h2 id="round3">第三轮：细化追问与学术定位（Q18–Q21）</h2>
+
+<p>本轮目标：明确模型矩阵、训练管线、学术贡献。</p>
+
+<!-- Q18 -->
+<div class="qa-block">
+  <div class="question">
+    <div class="q-label">🔴 Q18 · <span class="tag tag-arch">架构</span></div>
+    <div class="q-text">你说的"多个模型"到底是哪几个？列出所有模型的职责、输入、输出。</div>
+  </div>
+  <div class="answer">
+    <div class="a-label">✅ 你的回答</div>
+    <div class="a-text">
+      <p><strong>模型 1 — 云端 Gemini Robotics ER：</strong>负责观察复杂道路/识别物体，反馈物体信息和像素坐标给 Qwen。输入：图像。输出：路径/物体信息/像素坐标。</p>
+      <p><strong>模型 2 — 本地 Qwen2.5-VL：</strong>通过图像和其他模型信息判断能不能走，并记录信息。</p>
+      <p><strong>模型 3 — Orchestrator（裁决者）：</strong>对 Qwen 的判断主动相信，但根据问题选择上报/触发重新判断。JSON 阅读者——阅读通行信息/已通行信息，给 Qwen/Gemini 提供不能一眼看到目标的路径建议（通过语义推理）。</p>
+      <p><strong>模型 4 — 传感器诊断器：</strong>发现传感器参数不对、速度有问题、相机出问题——立即报告。输入：传感器参数，输出：日志。</p>
+    </div>
+  </div>
+  <div class="reflect">
+    <div class="r-label">🪞 自我审视提示</div>
+    <p>4 模型架构的职责已经清晰。Orchestrator 是最核心的一块——它既要裁决又要阅读 JSON 又要给路径建议。如果你发现它负担太重，考虑把「JSON 阅读者」拆成独立模块（不是独立模型，只是独立代码模块）。</p>
+  </div>
+</div>
+
+<!-- Q19 -->
+<div class="qa-block">
+  <div class="question">
+    <div class="q-label">🔴 Q19 · <span class="tag tag-feas">训练数据</span></div>
+    <div class="q-text">Orchestrator 的训练数据从哪来？State 怎么编码？用什么模型？</div>
+  </div>
+  <div class="answer">
+    <div class="a-label">✅ 你的回答</div>
+    <div class="a-text">
+      <p>Orchestrator 输入：RGB + JSON + 语义子图 + 理解输出。使用多模态融合。如果不行可能考虑用 Gemini Robotics ER 辅助。</p>
+      <p>预计最大 8B 模型。训练数据在 Isaac Sim 仿真里预训练一部分，再实机 fine-tune。</p>
+    </div>
+  </div>
+  <div class="reflect">
+    <div class="r-label">🪞 自我审视提示</div>
+    <p>「多模态融合」——这是你系统中最难的技术环节。RGB 的 Vision Encoder + JSON 的结构化编码 + 语义拓扑的 Graph Embedding 怎么拼成一个统一的 token 序列？建议在 Isaac Sim 阶段先用最简单的方案（JSON 序列化成文本拼在 prompt 里），跑通了再换更复杂的融合方式。</p>
+  </div>
+</div>
+
+<!-- Q20 — 最小实验细化 -->
+<div class="qa-block">
+  <div class="question">
+    <div class="q-label">🔴 Q20 · <span class="tag tag-feas">实验</span></div>
+    <div class="q-text">最小原型实验——请细化到操作步骤和变量定义。</div>
+  </div>
+  <div class="answer">
+    <div class="a-label">✅ 你的回答</div>
+    <div class="a-text">
+      <p>场景：两个房间 + 走廊（A 拿衣服 → B 浴室 → 来回直到 A 空）。已在 Q17 中细化。对比条件：纯 Gemini 单轮执行（提供 prompt + function call 工具）vs 本地 + 云端协作方案。</p>
+    </div>
+  </div>
+  <div class="reflect">
+    <div class="r-label">🪞 自我审视提示</div>
+    <p>你需要预先定义好数据采集表格的列。建议：Round / Condition / 总耗时 / VLM 调用次数 / 碰撞次数 / 人工干预次数 / JSON 大小 / 拓扑节点数 / 备注。每天实验结束填一行——两个月的实验做完，表格就是你的论文核心。</p>
+  </div>
+</div>
+
+<!-- Q21 -->
+<div class="qa-block">
+  <div class="question">
+    <div class="q-label">🔴 Q21 · <span class="tag tag-eval">贡献</span></div>
+    <div class="q-text">这个系统的学术贡献到底是什么？选一个主 Contribution。</div>
+  </div>
+  <div class="answer">
+    <div class="a-label">✅ 你的回答</div>
+    <div class="a-text">第一次做学术类型，需要学习后判断。后续明确了 Contribution（A + B）：结构化空间记忆方法 + 本地-云端协作系统。</div>
+  </div>
+  <div class="reflect">
+    <div class="r-label">🪞 自我审视提示</div>
+    <p>A+B 的组合是合适的。但你要小心：A（新方法）需要 novelty，你需要在 related work 中把「结构化 VLM 空间记忆」这条线理清楚——有没有人做过类似的事？差在哪？B（新系统）需要 real-world deployment 的结果——这意味着你的实验不能只在仿真里，实机数据是关键。</p>
+  </div>
+</div>
+
+<!-- ================================================================
+     附录：关键决策摘要
+     ================================================================ -->
+<h2 id="appendix">📋 附录：关键设计决策追溯表</h2>
+
+<table>
+  <thead>
+    <tr>
+      <th>决策点</th>
+      <th>选择</th>
+      <th>替代方案</th>
+      <th>选择理由</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>空间表征</td>
+      <td>JSON Token + 语义拓扑双层级</td>
+      <td>纯 prompt 拼接 / 向量 embedding / 纯 SLAM</td>
+      <td>JSON 可解释可编程，拓扑提供连通性推理能力</td>
+    </tr>
+    <tr>
+      <td>推理架构</td>
+      <td>云端大模型 + 本地小模型 + Orchestrator 裁决</td>
+      <td>纯云端 / 纯本地</td>
+      <td>兼顾推理深度和实时性，安全仲裁清晰</td>
+    </tr>
+    <tr>
+      <td>安全机制</td>
+      <td>三级仲裁：LiDAR 硬刹车 → 模型共识 → 路径柔控</td>
+      <td>单模型决策 / 简单投票</td>
+      <td>分级响应避免单点故障，0.15m 无条件急停</td>
+    </tr>
+    <tr>
+      <td>训练策略</td>
+      <td>BC warmup → GRPO RL（仿真预训练 + 实机 fine-tune）</td>
+      <td>纯 BC / 纯 RL / frozen weights</td>
+      <td>BC 提供起点，GRPO 提供探索；仿真降低样本成本</td>
+    </tr>
+    <tr>
+      <td>Orchestrator 模型</td>
+      <td>Qwen2.5-VL-7B + LoRA (r=32) + 4-bit 推理</td>
+      <td>Qwen2.5-VL-3B / SmolVLM2 / InternVL2</td>
+      <td>7B 级性能足够，LoRA + 量化降低显存需求</td>
+    </tr>
+    <tr>
+      <td>Fast VLM 模型</td>
+      <td>Qwen2.5-VL-3B（实时安全检查）</td>
+      <td>SmolVLM2-2.2B / Moondream2</td>
+      <td>3B 在本地 GPU 上 &lt;200ms 推理，延迟可接受</td>
+    </tr>
+    <tr>
+      <td>记忆存储</td>
+      <td>SQLite + JSON + FTS5 全文检索</td>
+      <td>ChromaDB / LanceDB / 纯文件系统</td>
+      <td>SQLite 零运维，FTS5 支持自然语言查询，JSON 灵活</td>
+    </tr>
+    <tr>
+      <td>仿真平台</td>
+      <td>Isaac Sim（ROS2 bridge）</td>
+      <td>Webots / Gazebo / Habitat</td>
+      <td>与现有 ROS2 栈兼容，视觉渲染质量高，支持 domain randomization</td>
+    </tr>
+    <tr>
+      <td>主 Contribution</td>
+      <td>A（新方法）+ B（新系统）</td>
+      <td>C（新发现）/ D（新 benchmark）</td>
+      <td>结构化空间记忆方法 + 本地-云端协作架构，有 novelty 有实用价值</td>
+    </tr>
+  </tbody>
+</table>
+
+<blockquote style="margin-top:2rem;">
+  <strong>📌 文档更新日志：</strong>2026-06-04 创建，涵盖 3 轮共 21 个问题及回答。后续若有新的设计讨论，追加到本文档末尾。
+</blockquote>
+
+</body>
+</html>

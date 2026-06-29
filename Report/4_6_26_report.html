@@ -1,0 +1,1085 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>本地VLM空间智能体 — 项目计划书 v3.0</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <style>
+    :root {
+      --primary:   #1a56db;
+      --primary-light: #e8f0fe;
+      --success:   #059669;
+      --success-bg:#ecfdf5;
+      --warning:   #d97706;
+      --warning-bg:#fffbeb;
+      --danger:    #dc2626;
+      --danger-bg: #fef2f2;
+      --gray-50:   #f9fafb;
+      --gray-100:  #f3f4f6;
+      --gray-200:  #e5e7eb;
+      --gray-300:  #d1d5db;
+      --gray-500:  #6b7280;
+      --gray-700:  #374151;
+      --gray-900:  #111827;
+      --radius:    8px;
+      --shadow:    0 1px 3px rgba(0,0,0,0.08), 0 1px 2px rgba(0,0,0,0.06);
+      --shadow-md: 0 4px 6px rgba(0,0,0,0.07), 0 2px 4px rgba(0,0,0,0.06);
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", -apple-system, BlinkMacSystemFont, sans-serif;
+      max-width: 1020px;
+      margin: 0 auto;
+      padding: 2rem 1.5rem 4rem;
+      color: var(--gray-900);
+      line-height: 1.75;
+      background: #fff;
+    }
+
+    h1 {
+      font-size: 1.8rem;
+      font-weight: 800;
+      border-bottom: 3px solid var(--primary);
+      padding-bottom: 0.6rem;
+      margin: 0.5rem 0 0.3rem;
+    }
+    h2 {
+      font-size: 1.3rem;
+      font-weight: 700;
+      border-left: 4px solid var(--primary);
+      padding-left: 0.8rem;
+      margin: 2.2rem 0 0.8rem;
+    }
+    h3 {
+      font-size: 1.05rem;
+      font-weight: 600;
+      margin: 1.4rem 0 0.5rem;
+      color: var(--gray-700);
+    }
+    p { margin: 0.6rem 0; }
+
+    .report-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 1rem 2.5rem;
+      padding: 0.8rem 1rem;
+      background: var(--gray-50);
+      border-radius: var(--radius);
+      font-size: 0.9rem;
+      color: var(--gray-500);
+      margin-bottom: 1.5rem;
+    }
+    .report-meta span strong { color: var(--gray-700); }
+
+    .badge { display: inline-block; padding: 2px 10px; border-radius: 12px; font-size: 0.83em; font-weight: 600; }
+    .badge-done  { background: var(--success-bg); color: var(--success); }
+    .badge-wip   { background: var(--warning-bg); color: var(--warning); }
+    .badge-plan  { background: var(--gray-100);  color: var(--gray-500); }
+    .badge-block { background: var(--danger-bg);  color: var(--danger); }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 1rem 0 1.5rem;
+      font-size: 0.93em;
+    }
+    th {
+      background: var(--gray-100);
+      font-weight: 700;
+      padding: 0.65rem 0.85rem;
+      text-align: left;
+      border-bottom: 2px solid var(--gray-300);
+    }
+    td {
+      padding: 0.6rem 0.85rem;
+      border-bottom: 1px solid var(--gray-200);
+    }
+    tr:nth-child(even) td { background: var(--gray-50); }
+
+    details {
+      margin: 0.5rem 0;
+      border: 1px solid var(--gray-200);
+      border-radius: var(--radius);
+      padding: 0.7rem 1rem;
+      background: var(--gray-50);
+      transition: background 0.2s;
+    }
+    details[open] { background: #f0f4fa; }
+    details summary {
+      cursor: pointer;
+      font-weight: 600;
+      font-size: 0.97em;
+      user-select: none;
+      outline: none;
+      list-style: none;
+    }
+    details summary::-webkit-details-marker { display: none; }
+    details summary::before { content: "▸ "; color: var(--primary); font-size: 0.85em; }
+    details[open] summary::before { content: "▾ "; }
+    details .detail-content { padding: 0.6rem 0 0.3rem 1.2rem; }
+    details .detail-content p { margin: 0.3rem 0; font-size: 0.93em; }
+
+    .callout {
+      border-left: 4px solid var(--primary);
+      background: var(--primary-light);
+      padding: 0.7rem 1rem;
+      border-radius: 0 var(--radius) var(--radius) 0;
+      margin: 1rem 0;
+      font-size: 0.93em;
+    }
+    .callout-warn {
+      border-left-color: var(--warning);
+      background: var(--warning-bg);
+    }
+    .callout-danger {
+      border-left-color: var(--danger);
+      background: var(--danger-bg);
+    }
+
+    pre {
+      background: #1e293b; color: #e2e8f0;
+      padding: 1rem 1.2rem; border-radius: var(--radius);
+      overflow-x: auto; font-size: 0.88em; line-height: 1.6;
+    }
+    code { font-family: "JetBrains Mono", "Fira Code", "Cascadia Code", Consolas, monospace; }
+
+    .code-block {
+      background: #1e293b; color: #e2e8f0;
+      padding: 1rem 1.2rem; border-radius: var(--radius);
+      overflow-x: auto; font-size: 0.85em; line-height: 1.55;
+      margin: 0.8rem 0;
+      font-family: "JetBrains Mono", "Fira Code", Consolas, monospace;
+      white-space: pre;
+    }
+
+    /* ========== 图表系统 — Intersection Observer ========== */
+    .chart-wrapper {
+      margin: 1.5rem 0 2rem;
+      padding: 1.5rem 1.2rem 1rem;
+      background: var(--gray-50);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      text-align: center;
+    }
+    .chart-wrapper .chart-title {
+      font-weight: 700; font-size: 1em;
+      margin-bottom: 0.8rem; color: var(--gray-700);
+    }
+    .chart-wrapper .chart-note {
+      font-size: 0.8em; color: var(--gray-500);
+      margin-top: 0.4rem; font-style: italic;
+    }
+
+    /* SVG 柱状动画 */
+    .lazy-bar {
+      transform: scaleY(0); opacity: 0;
+      transform-origin: bottom;
+      transition: transform 0.7s cubic-bezier(0.34, 1.56, 0.64, 1), opacity 0.5s;
+    }
+    .chart-wrapper.visible .lazy-bar { transform: scaleY(1); opacity: 1; }
+    .lazy-bar:nth-child(1) { transition-delay: 0.05s; }
+    .lazy-bar:nth-child(2) { transition-delay: 0.12s; }
+    .lazy-bar:nth-child(3) { transition-delay: 0.19s; }
+    .lazy-bar:nth-child(4) { transition-delay: 0.26s; }
+    .lazy-bar:nth-child(5) { transition-delay: 0.33s; }
+    .lazy-bar:nth-child(6) { transition-delay: 0.40s; }
+    .lazy-bar:nth-child(7) { transition-delay: 0.47s; }
+    .lazy-bar:nth-child(8) { transition-delay: 0.54s; }
+
+    .lazy-canvas-container {
+      opacity: 0;
+      transform: translateY(20px);
+      transition: opacity 0.7s ease, transform 0.7s ease;
+    }
+    .chart-wrapper.visible .lazy-canvas-container {
+      opacity: 1;
+      transform: translateY(0);
+    }
+
+    /* 架构图 */
+    .arch-diagram {
+      background: #1e293b; color: #e2e8f0;
+      padding: 1.5rem; border-radius: var(--radius);
+      font-family: "JetBrains Mono", "Fira Code", Consolas, monospace;
+      font-size: 0.8em; line-height: 1.5;
+      overflow-x: auto; white-space: pre;
+      margin: 1rem 0;
+    }
+
+    /* 步骤列表 */
+    .step-list { list-style: none; padding: 0; }
+    .step-list li {
+      display: flex; align-items: flex-start; gap: 0.6rem;
+      padding: 0.5rem 0; border-bottom: 1px solid var(--gray-100);
+    }
+    .step-list li:last-child { border-bottom: none; }
+    .step-check { margin-top: 0.15rem; accent-color: var(--success); width: 1.1em; height: 1.1em; }
+    .step-label { flex: 1; }
+    .step-label .step-name { font-weight: 600; }
+    .step-label .step-desc { font-size: 0.85em; color: var(--gray-500); display: block; }
+
+    .supervisor-rule {
+      display: flex;
+      align-items: flex-start;
+      gap: 0.8rem;
+      padding: 0.5rem 0.8rem;
+      margin: 0.3rem 0;
+      background: var(--gray-50);
+      border-radius: var(--radius);
+      font-size: 0.9em;
+      font-family: "JetBrains Mono", "Fira Code", Consolas, monospace;
+    }
+    .supervisor-rule .rule-id {
+      flex-shrink: 0;
+      width: 28px; height: 28px;
+      background: var(--primary);
+      color: #fff;
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 700;
+      font-size: 0.85em;
+    }
+
+    @media (max-width: 700px) {
+      body { padding: 1rem 0.8rem; }
+      h1 { font-size: 1.4rem; }
+      .report-meta { flex-direction: column; gap: 0.3rem; }
+      .arch-diagram { font-size: 0.65em; }
+    }
+    @media print {
+      body { max-width: 100%; color: #000; }
+      .chart-wrapper { break-inside: avoid; box-shadow: none; border: 1px solid #ccc; }
+    }
+  </style>
+</head>
+<body>
+
+<h1>🤖 本地 VLM 空间智能体 — 项目计划书 v3.0</h1>
+
+<div class="report-meta">
+  <span>📅 <strong>报告日期：</strong>2026年6月18日（v3.0 修订）</span>
+  <span>📝 <strong>版本：</strong>v3.0（回归双模型分工：大模型记忆 + 小模型执行）</span>
+  <span>📎 <strong>前置版本：</strong>v1.0（2026-06-04）· v2.0（2026-06-16）</span>
+</div>
+
+<div class="callout-warn">
+  <strong>🔄 v3.0 修订说明：</strong>v2.0 把云端降级为"异常兜底"、用 Qwen 自评置信度触发升级。实测暴露两个问题——<strong>(1) 两个模型共同决策时任务逻辑易冲突；(2) 模型对自身错误无感知（过度自信），置信度触发不可靠，该升级时不升级</strong>。v3.0 回归学术版的核心主张：<strong>大模型与小模型按职责分工，而非共同决策</strong>——<strong>云端大模型负责精确记录记忆（在探索/近距/交互时刻，由结构化条件触发），本地 Qwen3-VL-8B 负责基于语义拓扑的高效执行</strong>。记忆采用"词典式"按需检索（拓扑导航到位 → 再查局部语义），区别于 Embodied-RAG 的全局地图。代码层继续承担安全与空间计算；Supervisor 调度形态待定（确定性代码 or 小模型）。
+</div>
+
+<!-- ================================================================
+     一、项目概述
+     ================================================================ -->
+<h2>一、项目概述</h2>
+
+<div class="callout">
+  <strong>一句话定位：</strong>构建一个本地-云端协作的具身 VLM 智能体——<strong>云端大模型精确构建记忆、本地 Qwen3-VL-8B 高效执行</strong>，记忆以"词典式"按需检索（拓扑导航 → 局部语义精查），让轮式机器人在室内语义导航任务中可靠运行。
+</div>
+
+<h3>1.1 核心问题</h3>
+<p>传统 Navigation Stack 在长程任务中缺乏对空间的语义理解能力。纯 VLM（如 Gemini API）虽然理解力强，但延迟高（1–3s）、无持久记忆。VLA 模型偏重端到端执行，缺乏可审计的结构化记忆。而多模型本地部署方案对硬件要求过高——实测单张消费级显卡无法同时运行两个 VLM。</p>
+<p><strong>核心挑战：</strong>如何让云端大模型与本地小模型<strong>各取所长、按职责分工</strong>，而不是让两个模型"共同决策"（共同决策会引发逻辑冲突，且模型对自身错误无感知，靠置信度自评切换并不可靠）？具体而言——大模型应在<strong>何时、记录什么样的记忆</strong>，才能让小模型以最少的信息（拓扑优先、局部语义按需）高效完成任务，实现<strong>高信息利用率</strong>？同时，能写死的安全阈值、能算出来的坐标、能走 Nav2 的避障，仍交给确定性代码而非模型。</p>
+
+<h3>1.2 学术贡献定位</h3>
+
+<table>
+  <thead><tr><th>贡献类型</th><th>内容</th><th>证据要求</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><strong>A. 新方法</strong></td>
+      <td>提出 <strong>Spatial Token Graph (STG) 的"词典式"按需检索</strong>——双层级空间表征：上层语义拓扑图（房间连通性、路径方向）供<strong>远距导航</strong>，下层 JSON 结构化记忆（物体、置信度、空间-时间）作为<strong>"词典条目"供近距精查</strong>。执行任务时不通读全局地图，只在需要时翻对应词条，从而提高信息利用率（区别于 Embodied-RAG 的全局地图式利用）</td>
+      <td>与"全局地图式检索"baseline、无结构记忆 baseline 的信息利用率与耗时对比</td>
+    </tr>
+    <tr>
+      <td><strong>B. 新系统</strong></td>
+      <td>构建 <strong>大模型记忆 + 小模型执行的职责分工式</strong> 具身智能体：云端大模型在<strong>结构化触发时刻</strong>（进入新区域 / 近距交互）精确记录记忆，本地 Qwen3-VL-8B 基于拓扑高效执行，代码层承担安全与空间计算。<strong>按职责分工而非共同决策</strong>，规避逻辑冲突与"模型不自知错误"</td>
+      <td>多轮长程任务实验：云端调用随轮次下降的趋势；与"共同决策/置信度升级"方案的对比</td>
+    </tr>
+  </tbody>
+</table>
+
+<h3>1.3 预期量化目标</h3>
+<table>
+  <thead><tr><th>指标</th><th>Baseline (纯云端 API 无记忆)</th><th>目标 (本系统 ≥10 轮后)</th></tr></thead>
+  <tbody>
+    <tr><td>单轮任务平均耗时</td><td>T<sub>baseline</sub></td><td>≤ 0.5 × T<sub>baseline</sub></td></tr>
+    <tr><td>云端 API 调用次数/轮</td><td>N<sub>baseline</sub></td><td>≤ 0.1 × N<sub>baseline</sub>（记忆建好后复用，仅新区域/交互触发）</td></tr>
+    <tr><td>任务成功率</td><td>S<sub>baseline</sub></td><td>≥ S<sub>baseline</sub> + 15%</td></tr>
+    <tr><td>重规划次数/轮</td><td>R<sub>baseline</sub></td><td>≤ 0.4 × R<sub>baseline</sub></td></tr>
+    <tr><td>碰撞次数/轮</td><td>C<sub>baseline</sub></td><td>≤ 0.1 × C<sub>baseline</sub></td></tr>
+    <tr><td>本地 GPU 显存占用</td><td>≥16 GB（v1.0 双模型）</td><td>~24 GB（Qwen3-VL-8B FP16，免量化保证 FC 稳定）</td></tr>
+  </tbody>
+</table>
+
+<!-- ================================================================
+     二、系统架构
+     ================================================================ -->
+<h2>二、系统架构总览</h2>
+
+<div class="arch-diagram">
+┌──────────────────────────────────────────────────────────────────┐
+│              Agentic Loop (Supervisor-driven ReAct)               │
+│                                                                   │
+│   Observe ──→ Supervisor ──→ Skill Dispatch ──→ Execute ──→       │
+│   (传感器)    (状态机)       (explore/navigate/inspect)   (ROS2)   │
+│                                                                   │
+│  ┌─────────────────────────────────────────────────────────────┐ │
+│  │            SUPERVISOR（调度机制 · 形态待定：代码/小模型）     │ │
+│  │                                                              │ │
+│  │  输入: robot_state + semantic_map_json + user_command        │ │
+│  │  输出: 下一个 Skill + 目标 OR EmergencyStop OR DispatchCloud │ │
+│  │                                                              │ │
+│  │  决策依据: 布尔值 · 计数器 · 时间戳 · 数值阈值                │ │
+│  │  云端触发: 结构化条件(进入新区域/inspect近距)，非置信度自评  │ │
+│  └────┬──────────────┬──────────────┬──────────────────────────┘ │
+│       │              │              │                             │
+│       ▼              ▼              ▼                             │
+│  ┌─────────┐  ┌──────────┐  ┌──────────────────────────────┐    │
+│  │Qwen3-VL │  │云端大模型│  │   Safety Layer（纯代码）       │    │
+│  │  8B     │  │ ·记忆作者 │  │                              │    │
+│  │         │  │          │  │  LiDAR < 0.15m → 无条件急停    │    │
+│  │拓扑导航 │  │ 精确标注  │  │  传感器异常 → 立即停止         │    │
+│  │高效执行 │  │ 构建记忆  │  │  碰撞检测 → 后退 + 重规划      │    │
+│  │Skill执行│  │ 探索近距  │  │  不经过任何模型，< 10ms 响应   │    │
+│  │<500ms   │  │ 1-3s     │  │                              │    │
+│  └────┬────┘  └────┬─────┘  └──────────────┬───────────────┘    │
+│       │            │                       │                      │
+│       └────────────┼───────────────────────┘                      │
+│                    ▼                                              │
+│  ┌─────────────────────────────────────────────────────────────┐ │
+│  │              Spatial Memory System（双层级）                  │ │
+│  │                                                              │ │
+│  │  ┌─────────────────────┐  ┌────────────────────────────┐   │ │
+│  │  │ JSON 空间记忆 (SQLite)│  │ 语义拓扑 (Semantic Graph)   │   │ │
+│  │  │                     │  │                            │   │ │
+│  │  │ { areas: [...],     │  │  [厨房]──门──[走廊]──门──[卧室]│   │ │
+│  │  │   objects: [...],   │  │    │                 │      │   │ │
+│  │  │   connectivity: [...],│  │  物体:冰箱(0.92)   物体:床   │   │ │
+│  │  │   hazards: [...],   │  │    │                        │   │ │
+│  │  │   timestamp,        │  │  [客厅]─────────────────────┘   │ │
+│  │  │   confidence }      │  │                            │   │ │
+│  │  └─────────────────────┘  └────────────────────────────┘   │ │
+│  └─────────────────────────────────────────────────────────────┘ │
+│                    │                                              │
+│                    ▼                                              │
+│  ┌─────────────────────────────────────────────────────────────┐ │
+│  │         Tool Executor (ROS2 + rosbridge / MCP)               │ │
+│  │                                                              │ │
+│  │  navigate_to(x,y) │ capture_scene() │ emergency_stop()      │ │
+│  │  get_pose()       │ update_json()   │ check_sensors()       │ │
+│  │  query_topology() │ mark_area()     │ set_velocity()        │ │
+│  └─────────────────────────────────────────────────────────────┘ │
+└──────────────────────────────────────────────────────────────────┘
+                                     │
+                    ┌────────────────┴────────────────┐
+                    ▼                                 ▼
+          ┌───────────────┐               ┌──────────────────────┐
+          │ 小车 (Robot)   │               │  推理端 (Desktop)     │
+          │               │               │                      │
+          │ ROS2 Nodes    │               │ vLLM (OpenAI compat) │
+          │ rosbridge     │               │ Qwen3-VL-8B-Instruct │
+          │ :9090         │               │ Supervisor + Memory  │
+          │               │               │ 云端大模型 (记忆构建) │
+          │ Camera/LiDAR  │               │                      │
+          │ IMU/Odom      │               │                      │
+          └───────────────┘               └──────────────────────┘
+</div>
+
+<!-- ================================================================
+     三、核心组件说明
+     ================================================================ -->
+<h2>三、核心组件说明</h2>
+
+<h3>3.1 双层推理架构（本地执行 + 云端记忆）</h3>
+
+<p>两个模型<strong>按职责分工、不共同决策</strong>：本地 Qwen3-VL-8B 是<strong>执行者</strong>（拓扑导航、Skill 执行），云端大模型是<strong>记忆作者</strong>（在结构化触发时刻精确记录记忆）。代码层承担安全与空间计算。这从根上规避了"两模型抢同一决策导致逻辑冲突"与"模型不自知错误"两个问题。</p>
+
+<table>
+  <thead>
+    <tr><th>推理层</th><th>部署</th><th>延迟</th><th>触发频率</th><th>职责</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>Qwen3-VL-8B-Instruct</strong><br>（本地 · 执行者）</td>
+      <td>vLLM 本地 GPU<br>OpenAI 兼容 API</td>
+      <td>&lt;500ms</td>
+      <td>≥90% 请求</td>
+      <td>
+        · 基于语义拓扑高效导航：到达 Supervisor 下发的目标区域<br>
+        · 执行 Skill（explore/navigate/inspect）<br>
+        · 近距时读取"词典条目"做物体查找与状态判断<br>
+        · Function Calling：调用 ROS 工具（导航、拍照、查询拓扑）
+      </td>
+    </tr>
+    <tr>
+      <td><strong>云端大模型 (Claude API)</strong><br>（记忆作者）</td>
+      <td>Anthropic 云端</td>
+      <td>1–3s</td>
+      <td>≤10% 请求<br>（结构化触发）</td>
+      <td>
+        · 进入新区域 → 精确语义标注、记录区域类型与物体<br>
+        · 近距交互时刻（inspect）→ 高质量记录物体细节与空间关系<br>
+        · 写入 STG 记忆（区域、物体、置信度、空间-时间）<br>
+        · 触发由结构化条件决定，<strong>不依赖模型自评置信度</strong>
+      </td>
+    </tr>
+    <tr>
+      <td><strong>传统算法</strong><br>（模型替代）</td>
+      <td>本地 CPU</td>
+      <td>&lt;10ms</td>
+      <td>100%<br>（持续运行）</td>
+      <td>
+        · <strong>安全仲裁：</strong>LiDAR &lt; 0.15m → 无条件急停<br>
+        · <strong>空间计算：</strong>坐标变换、距离计算、BFS 路径搜索<br>
+        · <strong>Nav2 避障：</strong>全局/局部路径规划、动态避障<br>
+        · <strong>传感器诊断：</strong>帧率异常、IMU 漂移检测
+      </td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="callout">
+  <strong>💡 设计原则：</strong>模型只在必要时介入。能写死的阈值不交给模型判断；能算出来的坐标不让模型推理；能走 Nav2 的避障不经过 VLM。
+</div>
+
+<h3>3.2 Supervisor 调度机制（形态待定）</h3>
+
+<p>Supervisor 负责 Skill 调度与云端记忆触发。<strong>当前设计为确定性数值比较</strong>（只看结构化数值，不评估语义），但<strong>其最终形态待定——可能保持为确定性代码，也可能下沉为一个轻量小模型</strong>，下一轮专门讨论。以下为当前规则草案。</p>
+
+<h4>输入结构</h4>
+<div class="code-block">state = {
+    "robot": {
+        "pose": (x, y, yaw),        # 来自 /odom
+        "lidar_min_m": 0.42,        # 最近障碍物距离
+        "sensors_ok": True,         # 传感器健康汇总
+        "battery": 0.85,
+    },
+    "semantic_map": {
+        "areas": [
+            {"id": "kitchen",  "visited": True,  "last_seen": "2026-06-16T10:20"},
+            {"id": "corridor", "visited": True,  "last_seen": "2026-06-16T10:18"},
+            {"id": "room_b",   "visited": False, "last_seen": None},
+        ],
+        "objects": [
+            {"name": "fridge", "area": "kitchen", "confidence": 0.92, "last_seen": "..."},
+        ],
+        "connectivity": [...],
+        "hazards": [...],
+    },
+    "task": {
+        "skill": "explore",         # 当前 skill
+        "target": "room_b",         # 当前目标
+        "retry_count": 0,
+        "entered_new_area": False,  # 刚进入未记录区域 → 触发云端记忆
+    },
+    "user_command": "探索完所有房间后告诉我每个房间有什么",
+}</div>
+
+<h4>六条决策规则</h4>
+
+<div class="supervisor-rule">
+  <span class="rule-id">0</span>
+  <span><strong>安全——最高优先级，不经过任何判断：</strong><br>
+  <code>lidar_min_m &lt; 0.15 OR sensors_ok == False</code> → <strong>EmergencyStop</strong><br>
+  这条规则覆盖报告 v1.0 中的 Level 0 硬刹车，但不依赖任何模型仲裁。</span>
+</div>
+
+<div class="supervisor-rule">
+  <span class="rule-id">1</span>
+  <span><strong>进入新区域 / 近距交互——触发云端记忆：</strong><br>
+  <code>entered_new_area OR skill == "inspect"</code> → <strong>DispatchCloud(record)</strong><br>
+  由结构化条件触发云端大模型精确记录记忆，<strong>不依赖模型自评置信度</strong>（模型对自身错误无感知，置信度触发不可靠）。</span>
+</div>
+
+<div class="supervisor-rule">
+  <span class="rule-id">2</span>
+  <span><strong>重试上限——保守暂停：</strong><br>
+  <code>retry_count >= 3</code> → <strong>SafePause + Notify</strong><br>
+  同一任务连续 3 次失败（导航未到达、物体未识别），转入保守暂停并通知，不让模型反复试错。</span>
+</div>
+
+<div class="supervisor-rule">
+  <span class="rule-id">3</span>
+  <span><strong>未探索区域——切换到 explore skill：</strong><br>
+  <code>exists(area.visited == False)</code> → <strong>SwitchSkill("explore")</strong><br>
+  选择距离当前位置最近的未探索区域作为目标。Qwen 收到 explore prompt + 目标坐标。</span>
+</div>
+
+<div class="supervisor-rule">
+  <span class="rule-id">4</span>
+  <span><strong>用户导航目标——切换到 navigate skill：</strong><br>
+  <code>user_goal IN semantic_map.areas</code> → <strong>SwitchSkill("navigate")</strong><br>
+  从用户指令中解析目标（"去厨房"→"kitchen"），查拓扑图计算路径方向，下发给 Qwen。</span>
+</div>
+
+<div class="supervisor-rule">
+  <span class="rule-id">5</span>
+  <span><strong>任务完成：</strong><br>
+  <code>all(area.visited == True)</code> → <strong>TaskComplete</strong><br>
+  所有已知区域均已访问，汇总语义地图返回给用户。</span>
+</div>
+
+<div class="callout">
+  <strong>🔑 为什么不把 Skill 切换交给 Qwen 自己判断？</strong><br>
+  LLM 不擅长元决策。切换 Skill 的条件全部是确定性比较（"visited == False""retry >= 3""confidence < 0.6"），用 Python 写比让模型猜更可靠、更快（&lt;1ms vs >500ms）、且零幻觉风险。
+</div>
+
+<h3>3.3 安全仲裁</h3>
+
+<table>
+  <thead><tr><th>级别</th><th>触发条件</th><th>动作</th><th>决策者</th><th>延迟</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><strong>Level 0 — 硬刹车</strong></td>
+      <td>LiDAR 检测前方 &lt; 0.15m 障碍物<br>传感器心跳超时 &gt; 1s</td>
+      <td>无条件急停，不经过任何模型。<br>发送 <code>/emergency_stop</code> + 声光报警</td>
+      <td><strong>safety_layer.py</strong><br>（纯规则，独立进程）</td>
+      <td>&lt;10ms</td>
+    </tr>
+    <tr>
+      <td><strong>Level 1 — 局部避障</strong></td>
+      <td>Nav2 局部代价地图检测到障碍</td>
+      <td>Nav2 自主重规划路径。<br>若重规划失败 &gt; 3 次，通知 Supervisor → 升级 Claude</td>
+      <td><strong>Nav2 Stack</strong><br>（ROS 标准算法）</td>
+      <td>&lt;100ms</td>
+    </tr>
+    <tr>
+      <td><strong>Level 2 — 策略调整</strong></td>
+      <td>Qwen 判断路径可行但实际执行卡顿</td>
+      <td>Qwen 输出新的导航目标点，<br>Level 0/1 仍然在位，确保模型输出不导致碰撞</td>
+      <td><strong>Qwen</strong><br>（模型建议 + 安全层兜底）</td>
+      <td>0.5s</td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="callout-warn">
+  <strong>⚡ 与 v1.0 的关键区别：</strong>v1.0 的 Level 1（安全否决）依赖 3B Fast VLM 判断 + Orchestrator 多模型仲裁。v2.0 删除这一层——<strong>障碍物检测用 LiDAR 数值比较，路径规划用 Nav2 算法，都比 3B VLM 更可靠、更快、不占显存</strong>。模型只参与 Level 2（策略调整），而且是"建议"不是"仲裁"。
+</div>
+
+<h3>3.4 双层级空间记忆</h3>
+
+<p>空间记忆由<strong>云端大模型写入、本地 Qwen 读取</strong>，是两者分工的交汇点，也是 Supervisor 决策的核心数据源——visited 字段决定 explore skill 触发，connectivity 拓扑图决定 navigate 的路径方向。检索是<strong>"词典式"</strong>：远距只取拓扑，近距才翻出对应区域的物体词条。</p>
+
+<details>
+  <summary>📄 JSON 空间记忆 Schema（v2.0 新增 confidence_decay 字段）</summary>
+  <div class="detail-content">
+    <pre>{
+  "environment": "home_floor1",
+  "last_updated": "2026-06-16T10:30:00",
+  "areas": [
+    {
+      "id": "room_A",
+      "name": "卧室A",
+      "type": "bedroom",
+      "visited": true,
+      "center_pose": {"x": 1.2, "y": 2.5, "yaw": 0},
+      "bounds": {"x_min": 0, "x_max": 3.0, "y_min": 1.5, "y_max": 4.0},
+      "last_seen": "2026-06-16T10:20:00"
+    }
+  ],
+  "connectivity": [
+    {"from": "room_A", "to": "corridor", "via": "door_1",
+     "direction": "east", "width_m": 0.9,
+     "confidence": 0.95,
+     "confidence_decay": 0.95,        // v2.0 新增：24h 后自动 ×0.95
+     "last_verified": "2026-06-16T10:15:00"}
+  ],
+  "objects": [
+    {"id": "cup_01", "name": "杯子", "area": "room_A",
+     "pose": {"x": 1.5, "y": 3.2, "z": 0.8},
+     "relative_view": {"angle_deg": 15, "distance_m": 3.0, "uncertainty_m": 0.5},
+     "confidence": 0.90,
+     // v2.0 新增: 交叉传感器验证后才写入（RGB + Depth + LiDAR 三方一致）
+     "verified_by": ["rgb", "depth", "lidar"],
+     "last_seen": "2026-06-16T10:20:00"}
+  ],
+  "hazards": [
+    {"area": "corridor", "type": "narrow_passage",
+     "location": {"x": 4.2, "y": 2.8},
+     "note": "右侧有突出柜角，需靠左0.2m通行",
+     "encountered_count": 3,            // v2.0: 用于 Supervisor 判断是否需要 alert
+     "last_encountered": "2026-06-16T09:00:00"}
+  ]
+}</pre>
+  </div>
+</details>
+
+<details>
+  <summary>🗺️ 语义拓扑图 Schema</summary>
+  <div class="detail-content">
+    <pre>节点 (Node):
+  - id: string
+  - name: string
+  - type: room | corridor | doorway | landmark
+  - visited: bool              // ← Supervisor 规则 3 的核心判断字段
+  - centroid_pose: (x, y, yaw)
+  - properties: {
+      floor_type: string,
+      lighting: normal | dim | dark,
+      typical_objects: [...]
+    }
+
+边 (Edge):
+  - from: node_id
+  - to: node_id
+  - traversable: bool
+  - direction: relative compass
+  - width_m: float
+  - conditions: ["door_open", "light_on"]
+  - hazards: [{type: "narrow", mitigation: "keep_left_0.2m"}]</pre>
+  </div>
+</details>
+
+<!-- ================================================================
+     四、工程实现流程（阶段 + 完成标准，不设时间）
+     ================================================================ -->
+<h2>四、工程实现流程</h2>
+
+<div class="callout">
+  <strong>📐 设计原则：</strong>每个阶段有明确的<strong>完成标准（Definition of Done）</strong>和<strong>阶段验证实验</strong>。不设定具体日期，按验证通过顺序推进。核心假设在阶段 1 末进行关键决策。
+</div>
+
+<h3>阶段 1：最小原型验证</h3>
+
+<table>
+  <thead><tr><th>#</th><th>任务</th><th>产出</th><th>完成标准</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>1.1</td>
+      <td>确认硬件环境：vLLM + Qwen3-VL-8B（FP16）推理延迟 &lt; 500ms，显存占用实测</td>
+      <td>推理基准表</td>
+      <td>8B FP16 稳定运行，显存 ~24 GB，免量化（保证 function calling 稳定）</td>
+    </tr>
+    <tr>
+      <td>1.2</td>
+      <td>编写 spatial_memory.py：JSON Schema 定义 + CRUD API + 拓扑图 BFS 查询</td>
+      <td>memory.py + 单元测试</td>
+      <td>所有 CRUD 操作通过测试；拓扑路径查询正确返回最短路径</td>
+    </tr>
+    <tr>
+      <td>1.3</td>
+      <td>编写 safety_layer.py：LiDAR 订阅 + 阈值急停 + 传感器心跳检测</td>
+      <td>safety_layer.py</td>
+      <td>LiDAR 模拟 <0.15m → &lt;10ms 发出急停信号</td>
+    </tr>
+    <tr>
+      <td>1.4</td>
+      <td>编写 supervisor.py：6 条规则 + Skill 分发框架</td>
+      <td>supervisor.py + 状态日志</td>
+      <td>模拟 state 输入 → 输出正确的 Skill/EmergencyStop/DispatchCloud</td>
+    </tr>
+    <tr>
+      <td>1.5</td>
+      <td><strong>最小 A→B→A 实验：</strong>2 房间 + 走廊，取送任务 10 轮。对比 baseline（纯 Qwen 无记忆）vs 本系统（Qwen + JSON 记忆 + Supervisor）</td>
+      <td>实验数据 CSV</td>
+      <td>10 轮完成；数据完整；对比分析报告</td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="callout-danger">
+  <strong>⚠️ 阶段 1 关键决策点：</strong>如果最小原型不能证明「JSON 空间记忆 + Supervisor 状态机减少了 Qwen 推理次数和导航时间」，则暂停后续阶段，重新评估架构方向。这是整个项目最核心的假设——结构化记忆是否让单模型方案可行。
+</div>
+
+<h3>阶段 2：Skill 系统完善</h3>
+
+<table>
+  <thead><tr><th>#</th><th>任务</th><th>产出</th><th>完成标准</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>2.1</td>
+      <td>完善 explore skill：探索 prompt 模板 + 语义标注 function calling schema</td>
+      <td>skills/explore.py</td>
+      <td>Qwen 能根据图像识别房间类型，通过 FC 写入 JSON</td>
+    </tr>
+    <tr>
+      <td>2.2</td>
+      <td>完善 navigate skill：导航 prompt 模板 + 语义目标解析 + 拓扑路径注入</td>
+      <td>skills/navigate.py</td>
+      <td>用户说"去厨房"→ Supervisor 选 navigate → Qwen 下发正确导航点</td>
+    </tr>
+    <tr>
+      <td>2.3</td>
+      <td>完善 inspect skill：物体检查 prompt + 状态判断（开门/关闭/有/无）</td>
+      <td>skills/inspect.py</td>
+      <td>Qwen 能判断冰箱门开关、物体存在与否</td>
+    </tr>
+    <tr>
+      <td>2.4</td>
+      <td>实现云端记忆接入：Claude API client + 结构化触发（进入新区域 / inspect）→ 记忆写入</td>
+      <td>cloud_memory.py</td>
+      <td>进入新区域 → 云端被触发并写入高质量 STG 记忆条目</td>
+    </tr>
+    <tr>
+      <td>2.5</td>
+      <td><strong>验证实验：</strong>3 Skill 切换正确性测试（模拟完整探索→导航→检查流程）</td>
+      <td>测试日志</td>
+      <td>Supervisor 在正确时机切换 Skill；云端记忆在结构化触发条件满足时被调用</td>
+    </tr>
+  </tbody>
+</table>
+
+<h3>阶段 3：语义记忆与 ROS 工具集成</h3>
+
+<table>
+  <thead><tr><th>#</th><th>任务</th><th>产出</th><th>完成标准</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>3.1</td>
+      <td>ROS2 工具封装：navigate_to、capture_scene、get_pose、check_sensors 等 MCP/ROS tools</td>
+      <td>tools/ros_tools.py</td>
+      <td>所有工具可在 ReAct loop 中被 Qwen function calling 调用</td>
+    </tr>
+    <tr>
+      <td>3.2</td>
+      <td>记忆工具封装：update_json、query_topology、mark_area、get_unvisited 等</td>
+      <td>tools/memory_tools.py</td>
+      <td>Qwen 可通过 FC 读写语义地图；Supervisor 自动同步</td>
+    </tr>
+    <tr>
+      <td>3.3</td>
+      <td>交叉传感器验证：RGB 检测物体 + Depth 确认距离 + LiDAR 确认障碍 → 三方才写入 JSON</td>
+      <td>verification.py</td>
+      <td>单一传感器误判不污染记忆</td>
+    </tr>
+    <tr>
+      <td>3.4</td>
+      <td>置信度时间衰减：> 24h 未确认的信息自动 confidence × 0.95</td>
+      <td>memory 模块内置</td>
+      <td>衰减后 confidence < 0.5 触发 Supervisor 的 inspect skill</td>
+    </tr>
+    <tr>
+      <td>3.5</td>
+      <td><strong>验证实验：</strong>3 房间环境下 5 轮探索→记忆写入→导航验证。检查 JSON 记忆质量（精确度、召回率）</td>
+      <td>记忆质量报告</td>
+      <td>物体识别 precision ≥ 0.7；区域类型分类 accuracy ≥ 0.8</td>
+    </tr>
+  </tbody>
+</table>
+
+<h3>阶段 4：异常处理与安全加固</h3>
+
+<table>
+  <thead><tr><th>#</th><th>任务</th><th>产出</th><th>完成标准</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>4.1</td>
+      <td>Nav2 集成：全局规划器 + 局部避障 + 重规划逻辑</td>
+      <td>nav2_bridge.py</td>
+      <td>Qwen 下发目标点后 Nav2 自主完成路径规划与避障</td>
+    </tr>
+    <tr>
+      <td>4.2</td>
+      <td>降级策略：安全层独立进程运行，Qwen 进程崩溃不影响急停</td>
+      <td>多进程架构</td>
+      <td>kill Qwen 进程 → 机器人保持静止，safety_layer 仍在运行</td>
+    </tr>
+    <tr>
+      <td>4.3</td>
+      <td>Token 预算控制：上下文窗口管理（关键帧 + JSON 分级检索 + 滑动窗口）</td>
+      <td>context_manager.py</td>
+      <td>10 轮任务后 prompt < 32K tokens</td>
+    </tr>
+    <tr>
+      <td>4.4</td>
+      <td><strong>验证实验：</strong>注入故障（Qwen 崩溃、LiDAR 遮挡、未知物体、死胡同）。验证系统在每种场景下的行为</td>
+      <td>故障注入测试报告</td>
+      <td>所有注入故障正确处理：不碰撞、不回退到错误状态、合理降级</td>
+    </tr>
+  </tbody>
+</table>
+
+<h3>阶段 5：端到端实验与评估</h3>
+
+<table>
+  <thead><tr><th>#</th><th>任务</th><th>产出</th><th>完成标准</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>5.1</td>
+      <td>Condition A (baseline)：纯云端 API 无记忆，多轮长程任务</td>
+      <td>baseline 数据</td>
+      <td>≥10 轮有效数据</td>
+    </tr>
+    <tr>
+      <td>5.2</td>
+      <td>Condition B (本系统)：Qwen + Supervisor + JSON 记忆 + 云端记忆构建</td>
+      <td>实验组数据</td>
+      <td>≥10 轮有效数据</td>
+    </tr>
+    <tr>
+      <td>5.3</td>
+      <td><strong>消融实验：</strong>去掉 JSON 记忆 / 去掉 Supervisor（Qwen 自己管状态）/ 去掉云端记忆 / 去掉安全层</td>
+      <td>消融分析表</td>
+      <td>每个组件对最终指标的独立贡献量化</td>
+    </tr>
+    <tr>
+      <td>5.4</td>
+      <td>撰写论文初稿</td>
+      <td>论文草稿</td>
+      <td>包含方法描述 + 实验数据 + 消融分析 + 硬件效率对比</td>
+    </tr>
+  </tbody>
+</table>
+
+<h3>训练策略 <span class="badge badge-plan">待定</span></h3>
+
+<div class="callout-warn">
+  <p><strong>当前立场：</strong>Qwen3-VL-8B-Instruct 原生支持 function calling 和视觉理解，prompt engineering 可以覆盖当前需求（语义标注、物体识别、导航决策）。<strong>暂不进行模型微调。</strong></p>
+  <p style="margin-top:0.4rem;"><strong>触发微调的条件：</strong>若阶段 2/3 实验表明 Qwen 在以下任一场景持续失败——(a) 房间类型分类 accuracy &lt; 0.6；(b) function calling 格式错误率 &gt; 20%；(c) 置信度长期 &lt; 0.6 导致 Claude 调用频率 &gt; 30%——则启动 LoRA 微调计划。</p>
+  <p style="margin-top:0.4rem;"><strong>若启动微调：</strong>使用阶段 1–3 采集的 (图像, 指令, 工具调用) 三元组构建训练集；BC warmup → GRPO RL 路径保留 v1.0 的设计；但微调对象降为单个 Qwen3-VL-8B（而非 v1.0 的 7B Orchestrator + 3B Fast VLM）。</p>
+</div>
+
+<!-- ================================================================
+     五、硬件需求
+     ================================================================ -->
+<h2>五、硬件需求估算</h2>
+
+<div class="callout">
+  <strong>✅ v3.0 取舍：</strong>显存目标设为 ~24 GB——让 Qwen3-VL-8B 以 FP16 直接运行，<strong>免量化以保证 function calling 与语义判断的稳定性</strong>（INT4/INT8 会明显伤 FC 格式可靠性）。云端大模型不占本地显存。
+</div>
+
+<h3>5.1 推理端（实时运行）</h3>
+
+<table>
+  <thead><tr><th>组件</th><th>最低配置</th><th>推荐配置</th><th>说明</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><strong>本地推理 GPU</strong></td>
+      <td>≥ 16 GB VRAM</td>
+      <td>≥ 24 GB VRAM</td>
+      <td>Qwen3-VL-8B FP16 ≈ 16 GB + KV cache + 视觉特征。推荐 24 GB（RTX 4090/3090 级）<strong>直接 FP16 运行、免量化</strong>，避免量化损伤 function calling</td>
+    </tr>
+    <tr>
+      <td><strong>机器人端</strong></td>
+      <td>N/A</td>
+      <td>N/A</td>
+      <td>机器人仅运行 ROS2 + rosbridge + 传感器驱动，对 GPU 无要求</td>
+    </tr>
+    <tr>
+      <td><strong>网络</strong></td>
+      <td>局域网 ≥ 100 Mbps</td>
+      <td>局域网 ≥ 1 Gbps</td>
+      <td>桌面端与小车之间通过 rosbridge WebSocket 传输图像和指令</td>
+    </tr>
+    <tr>
+      <td><strong>存储</strong></td>
+      <td>≥ 30 GB SSD</td>
+      <td>≥ 100 GB SSD</td>
+      <td>模型权重（~16 GB FP16 / ~8 GB INT8）+ JSON 记忆库 + 实验数据</td>
+    </tr>
+  </tbody>
+</table>
+
+<h3>5.2 可选的训练端（离线，待定）</h3>
+
+<table>
+  <thead><tr><th>阶段</th><th>最低配置</th><th>推荐配置</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><strong>LoRA 微调</strong> (Qwen3-VL-8B)</td>
+      <td>1× GPU ≥ 16 GB VRAM<br>（LoRA rank=32 + 4-bit + 梯度检查点）</td>
+      <td>1× GPU ≥ 24 GB VRAM</td>
+    </tr>
+  </tbody>
+</table>
+
+<!-- ================================================================
+     六、预期实验结果
+     ================================================================ -->
+<h2>六、预期实验结果（假设验证）</h2>
+
+<div class="chart-wrapper">
+  <div class="chart-title">📊 预期：10 轮 A→B→A 任务耗时趋势</div>
+  <svg width="550" height="280" viewBox="0 0 550 280" style="max-width:100%;">
+    <line x1="60" y1="30" x2="60" y2="230" stroke="var(--gray-300)" stroke-width="1"/>
+    <line x1="60" y1="230" x2="520" y2="230" stroke="var(--gray-300)" stroke-width="1"/>
+    <text x="50" y="235" text-anchor="end" font-size="10" fill="var(--gray-500)">0</text>
+    <text x="50" y="155" text-anchor="end" font-size="10" fill="var(--gray-500)">120s</text>
+    <text x="50" y="75" text-anchor="end" font-size="10" fill="var(--gray-500)">240s</text>
+    <!-- Baseline 柱 (纯云端 API 无记忆) -->
+    <rect class="lazy-bar" x="75" y="155" width="30" height="75" fill="#94a3b8" rx="2">
+      <title>Baseline R1: 150s</title></rect>
+    <rect class="lazy-bar" x="120" y="148" width="30" height="82" fill="#94a3b8" rx="2">
+      <title>Baseline R5: 156s</title></rect>
+    <rect class="lazy-bar" x="165" y="152" width="30" height="78" fill="#94a3b8" rx="2">
+      <title>Baseline R10: 148s</title></rect>
+    <!-- Ours (单模型 + Supervisor + JSON 记忆) -->
+    <rect class="lazy-bar" x="230" y="150" width="30" height="80" fill="var(--primary)" rx="2">
+      <title>Ours R1: 155s</title></rect>
+    <rect class="lazy-bar" x="275" y="185" width="30" height="45" fill="var(--primary)" rx="2">
+      <title>Ours R5: 90s</title></rect>
+    <rect class="lazy-bar" x="320" y="200" width="30" height="30" fill="var(--primary)" rx="2">
+      <title>Ours R10: 60s</title></rect>
+    <text x="90" y="250" text-anchor="middle" font-size="10" fill="var(--gray-500)">Baseline R1</text>
+    <text x="135" y="250" text-anchor="middle" font-size="10" fill="var(--gray-500)">Baseline R5</text>
+    <text x="180" y="250" text-anchor="middle" font-size="10" fill="var(--gray-500)">Baseline R10</text>
+    <text x="245" y="250" text-anchor="middle" font-size="10" fill="var(--gray-500)">Ours R1</text>
+    <text x="290" y="250" text-anchor="middle" font-size="10" fill="var(--gray-500)">Ours R5</text>
+    <text x="335" y="250" text-anchor="middle" font-size="10" fill="var(--gray-500)">Ours R10</text>
+    <rect x="400" y="60" width="12" height="12" fill="#94a3b8" rx="2"/>
+    <text x="418" y="71" font-size="10" fill="var(--gray-500)">纯云端 API（无记忆）</text>
+    <rect x="400" y="80" width="12" height="12" fill="var(--primary)" rx="2"/>
+    <text x="418" y="91" font-size="10" fill="var(--gray-500)">Ours (Qwen+Sup+JSON)</text>
+  </svg>
+  <div class="chart-note">⚠️ 数据为假设值，仅示意预期趋势。实际数据以阶段 1 最小原型实验为准。</div>
+</div>
+
+<div class="chart-wrapper">
+  <div class="chart-title">📊 预期：云端 API 调用频率对比（每轮任务）</div>
+  <svg width="550" height="260" viewBox="0 0 550 260" style="max-width:100%;">
+    <line x1="80" y1="30" x2="80" y2="210" stroke="var(--gray-300)" stroke-width="1"/>
+    <line x1="80" y1="210" x2="520" y2="210" stroke="var(--gray-300)" stroke-width="1"/>
+    <text x="70" y="215" text-anchor="end" font-size="10" fill="var(--gray-500)">0</text>
+    <text x="70" y="165" text-anchor="end" font-size="10" fill="var(--gray-500)">5</text>
+    <text x="70" y="115" text-anchor="end" font-size="10" fill="var(--gray-500)">10</text>
+    <text x="70" y="65" text-anchor="end" font-size="10" fill="var(--gray-500)">15</text>
+    <!-- Baseline: high API calls every round -->
+    <rect class="lazy-bar" x="110" y="70" width="40" height="140" fill="#94a3b8" rx="2">
+      <title>Baseline: 14 calls</title></rect>
+    <rect class="lazy-bar" x="170" y="75" width="40" height="135" fill="#94a3b8" rx="2">
+      <title>Baseline: 13.5 calls</title></rect>
+    <!-- Ours: almost no API calls after initial -->
+    <rect class="lazy-bar" x="280" y="160" width="40" height="50" fill="var(--primary)" rx="2">
+      <title>Ours R1: 2 calls</title></rect>
+    <rect class="lazy-bar" x="340" y="180" width="40" height="30" fill="var(--primary)" rx="2">
+      <title>Ours R5: 1 call</title></rect>
+    <rect class="lazy-bar" x="400" y="195" width="40" height="15" fill="var(--primary)" rx="2">
+      <title>Ours R10: 0 calls</title></rect>
+    <text x="130" y="230" text-anchor="middle" font-size="9" fill="var(--gray-500)">Baseline R1</text>
+    <text x="190" y="230" text-anchor="middle" font-size="9" fill="var(--gray-500)">Baseline R10</text>
+    <text x="300" y="230" text-anchor="middle" font-size="9" fill="var(--gray-500)">Ours R1</text>
+    <text x="360" y="230" text-anchor="middle" font-size="9" fill="var(--gray-500)">Ours R5</text>
+    <text x="420" y="230" text-anchor="middle" font-size="9" fill="var(--gray-500)">Ours R10</text>
+    <rect x="430" y="45" width="12" height="12" fill="#94a3b8" rx="2"/>
+    <text x="448" y="56" font-size="10" fill="var(--gray-500)">纯云端 API（无记忆）</text>
+    <rect x="430" y="65" width="12" height="12" fill="var(--primary)" rx="2"/>
+    <text x="448" y="76" font-size="10" fill="var(--gray-500)">Ours（仅记忆构建触发云端）</text>
+  </svg>
+  <div class="chart-note">⚠️ 核心假设：记忆由云端在新区域/交互时构建，建好后绝大多数任务由本地 Qwen 复用拓扑完成，云端调用随轮次下降。</div>
+</div>
+
+<!-- ================================================================
+     七、关键设计决策（v2.0 更新）
+     ================================================================ -->
+<h2>七、关键设计决策</h2>
+
+<table>
+  <thead><tr><th>决策点</th><th>v1.0</th><th>v3.0（当前）</th><th>变更理由</th></tr></thead>
+  <tbody>
+    <tr><td>本地模型</td><td>Qwen 7B (编排) + Qwen 3B (安检)</td><td><strong>Qwen3-VL-8B（唯一）</strong></td><td>实测单卡无法同时运行两个 VLM；8B 推理能力足以覆盖编排+语义理解</td></tr>
+    <tr><td>实时安检</td><td>Qwen 3B Fast VLM (&lt;200ms)</td><td><strong>代码层 LiDAR 阈值 + Nav2 避障 (&lt;10ms)</strong></td><td>障碍物判断不需要 VLM；规则引擎更快更可靠</td></tr>
+    <tr><td>多模型协作</td><td>Orchestrator 协调 Gemini + 3B + 7B 共识</td><td><strong>按职责分工：大模型记忆 / 小模型执行，不做仲裁</strong></td><td>共同决策易逻辑冲突、且模型不自知错误；分工边界清晰、无死锁</td></tr>
+    <tr><td>空间表征</td><td>JSON Token + 语义拓扑双层级</td><td><strong>不变（保持）</strong></td><td>核心贡献不变；新增 confidence_decay 和交叉验证字段</td></tr>
+    <tr><td>安全仲裁</td><td>Level 0/1/2 分级（部分依赖模型）</td><td><strong>Level 0 纯代码 / Level 1 Nav2 / Level 2 模型建议</strong></td><td>去模型化 Level 1；模型只做策略建议不做安全仲裁</td></tr>
+    <tr><td>云端定位</td><td>Gemini API 常规参与推理</td><td><strong>云端大模型作"记忆作者"，结构化触发（新区域/近距）</strong></td><td>云端不做决策、只精确记录记忆；记忆建好后本地复用，调用随轮次下降</td></tr>
+    <tr><td>训练策略</td><td>BC warmup → GRPO RL</td><td><strong>待定（prompt engineering 先行）</strong></td><td>先验证 prompt 够用；不够再启动 LoRA 微调</td></tr>
+    <tr><td>记忆存储</td><td>SQLite + JSON + FTS5</td><td><strong>不变（保持）</strong></td><td>零运维，JSON 灵活，FTS5 支持自然语言检索</td></tr>
+    <tr><td>冷启动策略</td><td>主动探索 + 用户 hint 可选</td><td><strong>Supervisor 规则 3 驱动（visited == False → explore）</strong></td><td>探索逻辑从模型建议升级为确定性触发</td></tr>
+  </tbody>
+</table>
+
+<!-- ================================================================
+     八、风险与缓解（v2.0 更新）
+     ================================================================ -->
+<h2>八、风险与缓解</h2>
+
+<table>
+  <thead><tr><th>风险</th><th>严重程度</th><th>触发条件</th><th>缓解措施</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><strong>核心假设不成立</strong></td>
+      <td><span class="badge badge-block">🔴 阻断</span></td>
+      <td>阶段 1 最小原型：JSON 记忆 + Supervisor 未显著减少模型推理次数或导航时间</td>
+      <td>回退到纯 prompt 方案；重新评估 Supervisor 规则的粒度；检查 JSON 记忆信息量是否不足以支撑决策</td>
+    </tr>
+    <tr>
+      <td><strong>Qwen3-VL-8B 单体能力不足</strong></td>
+      <td><span class="badge badge-wip">🟡 高</span></td>
+      <td>Qwen 语义判断错误率高（房间/物体识别错误），或 function calling 格式错误率过高</td>
+      <td>① 优化 prompt 工程（Few-shot + 更精确的 tool description）；② 若 FC 格式错误是系统性的 → 启动 LoRA 微调；③ 若语义理解不足 → 评估升级到更大模型或换用 InternVL2</td>
+    </tr>
+    <tr>
+      <td><strong>Supervisor 规则覆盖不全</strong></td>
+      <td><span class="badge badge-wip">🟡 高</span></td>
+      <td>真实环境中出现 6 条规则未覆盖的状态组合，导致 Skill 切换卡住或错误分发</td>
+      <td>① 阶段 4 故障注入测试覆盖边缘 case；② Supervisor 内置"未知状态 → 安全暂停 + 通知人工"的默认兜底；③ 规则日志全量记录，便于事后增加新规则</td>
+    </tr>
+    <tr>
+      <td><strong>错误传播（Garbage In, Garbage Forever）</strong></td>
+      <td><span class="badge badge-wip">🟡 高</span></td>
+      <td>传感器或 Qwen 一次误判导致 JSON 中持久存储错误信息</td>
+      <td>① 交叉传感器验证（RGB + Depth + LiDAR 三方一致才写入）；② 置信度时间衰减（>24h ×0.95）；③ 定期回访验证关键空间节点</td>
+    </tr>
+    <tr>
+      <td><strong>长程任务 Token 预算爆炸</strong></td>
+      <td><span class="badge badge-wip">🟡 中</span></td>
+      <td>多轮任务后 JSON 过大或历史帧过多，超出 Qwen 上下文窗口</td>
+      <td>① JSON 按任务目标语义检索相关条目（不喂全量）；② 视觉帧仅保留关键帧（场景变化阈值触发存储）；③ 滑动窗口限制历史帧数</td>
+    </tr>
+    <tr>
+      <td><strong>云端 API 不可用</strong></td>
+      <td><span class="badge badge-wip">🟡 中</span></td>
+      <td>网络中断或 API 限流，记忆构建路径断开</td>
+      <td>① 云端不可用时延后记忆写入（标记 pending，恢复后补记）；② 已建好的记忆不受影响，Qwen 继续用拓扑导航/执行；③ 连续失败 → 暂停新区域探索，请求人工介入</td>
+    </tr>
+    <tr>
+      <td><strong>Qwen 进程崩溃</strong></td>
+      <td><span class="badge badge-wip">🟡 中</span></td>
+      <td>vLLM OOM 或推理异常导致 Qwen 不可用</td>
+      <td>① 安全层独立进程运行，Qwen 崩溃不影响急停；② Supervisor 检测 Qwen 超时 → 自动重连 + 通知；③ 连续崩溃 → 降级为纯 Nav2 导航 + 人工接管</td>
+    </tr>
+    <tr>
+      <td><strong>仿真→实机迁移 gap</strong></td>
+      <td><span class="badge badge-wip">🟡 中</span></td>
+      <td>不同光照/布局下 Qwen 识别准确率下降</td>
+      <td>① 仿真先行——URDF / 传感器话题 / MCP-ROS API 与真机一致，初期在仿真快速迭代；② 关键节点用实机图像 Few-shot 校准 prompt；③ 必要时在实机采集数据上 LoRA 微调</td>
+    </tr>
+  </tbody>
+</table>
+
+<!-- ================================================================
+     九、总结
+     ================================================================ -->
+<h2>九、总结</h2>
+
+<div class="callout">
+  <p><strong>一句话总结：</strong>v3.0 的核心赌注是——<em>大模型与小模型按职责分工而非共同决策：云端大模型在结构化时刻精确构建记忆，本地 Qwen3-VL-8B 基于拓扑高效执行，记忆以"词典式"按需检索；安全与空间计算交给确定性代码</em>。如果这个架构在阶段 1 验证通过，将证明<strong>多 agent 在单机器人上的优势来自"各取所长"，而非共同决策</strong>。</p>
+  <p style="margin-top:0.5rem;"><strong>最小验证（阶段 1）：</strong>A→B→A 的 10 轮实验是唯一关键决策点。核心指标不是绝对性能，而是<strong>趋势</strong>——JSON 记忆积累后，Qwen 推理次数和任务耗时是否持续下降。</p>
+  <p style="margin-top:0.5rem;"><strong>v2.0 → v3.0 的转变：</strong>v2.0 把云端当"兜底"、靠模型自评置信度升级，实测发现共同决策易冲突、且模型不自知错误。v3.0 改为<strong>按职责分工</strong>——云端专做记忆、本地专做执行、代码专做安全与计算，三者边界清晰、互不抢决策；远距用拓扑、近距才查语义词典，信息利用率高。</p>
+</div>
+
+<blockquote style="margin-top:2rem;">
+  <strong>📌 文档维护：</strong>本计划书为 v3.0。v1.0 的 4 模型架构、v2.0 的"云端兜底 + 置信度升级"均已修订。学术主张以 <a href="../proposal.md">proposal.md</a> 为准，后续实验数据更新到本文档图表中。
+  <br><strong>📎 关联文档：</strong><a href="4_6_26_qa_dialogue.html">4_6_26_qa_dialogue.html</a>（学术质疑对话录）
+</blockquote>
+
+<!-- ================================================================
+     Intersection Observer — 图表滚动触发引擎
+     ================================================================ -->
+<script>
+(function() {
+  const wrappers = document.querySelectorAll('.chart-wrapper');
+  if (!wrappers.length) return;
+
+  const observer = new IntersectionObserver((entries) => {
+    entries.forEach(entry => {
+      const el = entry.target;
+      if (entry.isIntersecting) {
+        el.classList.add('visible');
+      } else {
+        el.classList.remove('visible');
+      }
+    });
+  }, { threshold: 0.25 });
+
+  wrappers.forEach(w => observer.observe(w));
+})();
+</script>
+
+</body>
+</html>

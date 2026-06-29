@@ -1,0 +1,98 @@
+"""C 分层混合 记录格式的 JSON Schema + 校验。
+
+同一个 schema 同时用于：
+  - Anthropic record_memory 工具的 input_schema（强制 Claude 产出合法结构）
+  - 本地 jsonschema 校验（写入前把关）
+设计要点：abs_pose / abs_pose_delta_m / view.distance_m / roi 等几何字段允许 null，
+因为 slice 阶段不算绝对坐标（VLM 不臆造），由日后几何管线回填。
+"""
+import jsonschema
+
+_POSE = {
+    "type": ["object", "null"],
+    "properties": {
+        "x": {"type": "number"},
+        "y": {"type": "number"},
+        "z": {"type": "number"},
+    },
+    "additionalProperties": False,
+}
+
+_ROI = {
+    "type": ["object", "null"],
+    "description": "归一化 bbox：x,y 左上角，w,h 宽高，均 0~1。供代码在深度图上取该区域。",
+    "properties": {
+        "x": {"type": "number"}, "y": {"type": "number"},
+        "w": {"type": "number"}, "h": {"type": "number"},
+    },
+    "additionalProperties": False,
+}
+
+_VIEW = {
+    "type": ["object", "null"],
+    "properties": {
+        "angle_deg": {"type": ["number", "null"]},
+        "distance_m": {"type": ["number", "null"]},        # 代码用深度回填，VLM 留 null
+        "distance_delta_m": {"type": ["number", "null"]},  # ± 余量，代码回填
+    },
+    "additionalProperties": False,
+}
+
+_OBJECT = {
+    "type": "object",
+    "required": ["name"],
+    "properties": {
+        "id": {"type": "string"},
+        "name": {"type": "string"},
+        "spatial": {"type": "string", "description": "定性/相对位置描述，如'桌面右侧'"},
+        "roi": _ROI,
+        "view": _VIEW,
+        "abs_pose": _POSE,                                  # 几何回填，VLM 留 null
+        "abs_pose_delta_m": {"type": ["number", "null"]},
+        "state": {"type": ["string", "null"]},
+        "affordance": {"type": "array", "items": {"type": "string"}},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "verified_by": {"type": "array", "items": {"type": "string"}},
+        "last_seen": {"type": "string"},
+    },
+    "additionalProperties": False,
+}
+
+_HAZARD = {
+    "type": "object",
+    "properties": {
+        "type": {"type": "string"},
+        "where": {"type": "string"},
+        "note": {"type": "string"},
+    },
+    "additionalProperties": False,
+}
+
+MEMORY_RECORD_SCHEMA = {
+    "type": "object",
+    # objects 期望非空，但不设为硬 required：部分模型/网关倾向只回 summary；
+    # 切片以"打通 image→Claude→JSON→校验→写盘"为准，objects 充实度属 prompt/模型调优。
+    "required": ["area", "type"],
+    "properties": {
+        "area": {"type": "string"},
+        "type": {"type": "string", "description": "区域类型，如 office/corridor/kitchen"},
+        "summary": {"type": "string"},
+        "observed_at": {"type": "string"},
+        "view_pose": {
+            "type": ["object", "null"],
+            "properties": {
+                "x": {"type": "number"}, "y": {"type": "number"}, "yaw": {"type": "number"}
+            },
+            "additionalProperties": False,
+        },
+        "objects": {"type": "array", "items": _OBJECT},
+        "hazards": {"type": "array", "items": _HAZARD},
+    },
+    "additionalProperties": False,
+}
+
+
+def validate_memory_record(obj: dict) -> dict:
+    """校验记录；不合法抛 jsonschema.ValidationError（调用方做一次修复重试）。"""
+    jsonschema.validate(obj, MEMORY_RECORD_SCHEMA)
+    return obj

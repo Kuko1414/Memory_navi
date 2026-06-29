@@ -1,0 +1,161 @@
+{
+  "area": "explore_smoke3",
+  "type": "corridor",
+  "summary": "室内走廊区域，可见明显烟雾弥漫（烟雾浓度中等，视线部分受阻）。走廊两侧为墙壁，天花板有嵌入式和管状灯具，地面为光滑材质。近处左侧墙壁可见仪表或配电箱，右侧墙壁有疑似门框或通道开口。远处能见度因烟雾降低。",
+  "objects": [
+    {
+      "name": "corridor",
+      "spatial": "正前方延伸的走廊空间",
+      "roi": {
+        "x": 0.1,
+        "y": 0.2,
+        "w": 0.8,
+        "h": 0.7
+      },
+      "state": "烟雾弥漫",
+      "affordance": [
+        "navigate",
+        "traverse"
+      ],
+      "confidence": 0.95,
+      "abs_pose": null,
+      "abs_pose_delta_m": null,
+      "last_seen": "2026-06-29T13:41:52+00:00"
+    },
+    {
+      "name": "smoke",
+      "spatial": "弥漫于整个走廊空间",
+      "roi": {
+        "x": 0,
+        "y": 0,
+        "w": 1,
+        "h": 0.7
+      },
+      "state": "中等浓度，持续扩散",
+      "confidence": 0.9,
+      "abs_pose": null,
+      "abs_pose_delta_m": null,
+      "last_seen": "2026-06-29T13:41:52+00:00"
+    },
+    {
+      "name": "ceiling_light_fixture",
+      "spatial": "天花板中央偏右",
+      "roi": {
+        "x": 0.35,
+        "y": 0.0,
+        "w": 0.3,
+        "h": 0.15
+      },
+      "state": "亮灯状态",
+      "affordance": [
+        "illuminate"
+      ],
+      "confidence": 0.85,
+      "abs_pose": null,
+      "abs_pose_delta_m": null,
+      "last_seen": "2026-06-29T13:41:52+00:00"
+    },
+    {
+      "name": "wall_left",
+      "spatial": "走廊左侧墙壁",
+      "roi": {
+        "x": 0.0,
+        "y": 0.1,
+        "w": 0.2,
+        "h": 0.8
+      },
+      "state": "可见仪表或控制面板",
+      "affordance": [
+        "support_structure"
+      ],
+      "confidence": 0.85,
+      "abs_pose": null,
+      "abs_pose_delta_m": null,
+      "last_seen": "2026-06-29T13:41:52+00:00"
+    },
+    {
+      "name": "wall_right",
+      "spatial": "走廊右侧墙壁",
+      "roi": {
+        "x": 0.75,
+        "y": 0.1,
+        "w": 0.25,
+        "h": 0.8
+      },
+      "state": "可见门框或通道开口",
+      "affordance": [
+        "support_structure",
+        "passage"
+      ],
+      "confidence": 0.8,
+      "abs_pose": null,
+      "abs_pose_delta_m": null,
+      "last_seen": "2026-06-29T13:41:52+00:00"
+    },
+    {
+      "name": "floor",
+      "spatial": "走廊地面",
+      "roi": {
+        "x": 0.05,
+        "y": 0.65,
+        "w": 0.9,
+        "h": 0.35
+      },
+      "state": "光滑材质，可见反光",
+      "affordance": [
+        "support",
+        "traverse"
+      ],
+      "confidence": 0.9,
+      "abs_pose": null,
+      "abs_pose_delta_m": null,
+      "last_seen": "2026-06-29T13:41:52+00:00"
+    },
+    {
+      "name": "electrical_panel_or_meter",
+      "spatial": "左侧墙壁近处",
+      "roi": {
+        "x": 0.02,
+        "y": 0.25,
+        "w": 0.12,
+        "h": 0.3
+      },
+      "state": "固定于墙面",
+      "affordance": [
+        "inspect",
+        "monitor"
+      ],
+      "confidence": 0.6,
+      "abs_pose": null,
+      "abs_pose_delta_m": null,
+      "last_seen": "2026-06-29T13:41:52+00:00"
+    },
+    {
+      "name": "doorway_or_passage_right",
+      "spatial": "右侧墙壁中段",
+      "roi": {
+        "x": 0.8,
+        "y": 0.2,
+        "w": 0.18,
+        "h": 0.5
+      },
+      "state": "疑似门框或通道开口",
+      "affordance": [
+        "pass_through",
+        "enter"
+      ],
+      "confidence": 0.55,
+      "abs_pose": null,
+      "abs_pose_delta_m": null,
+      "last_seen": "2026-06-29T13:41:52+00:00"
+    }
+  ],
+  "hazards": [
+    {
+      "type": "smoke",
+      "where": "整个走廊区域",
+      "note": "烟雾降低能见度，可能指示火灾或烟雾源，需谨慎通行并定位烟雾来源"
+    }
+  ],
+  "observed_at": "2026-06-29T13:41:52+00:00"
+}
