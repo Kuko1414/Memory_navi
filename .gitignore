@@ -4,9 +4,34 @@ __pycache__/
 Report/__pycache__/
 .webui_secret_key
 
+# 运行时/短期实验产物（记忆地图、拓扑、日志），不推 GitHub —— 只留代码
+memory_navi/memory/
+*.log
+*.output
+.DS_Store
+
 # 大文件不推 GitHub
 paper/*.pdf
 memory_navi/ros-mcp-server/examples/*/images/*.gif
 memory_navi/ros-mcp-server/examples/*/images/*.png
 memory_navi/ros-mcp-server/docs/images/*.gif
 *.gif
+
+.claude/
+paper/
+Report/
+/webui_secret_key
+academic profile*.md
+CLAUDE.md
+Cooperate.md
+launch_sim.sh
+Memroy.md
+Process.md
+SETUP.md
+start_all.sh
+tobe_learn.md
+user_background.md
+AGENTS.md
+# vendored ros-mcp-server 上游 demo/截图/文档 —— 只留源码 ros_mcp/**
+memory_navi/ros-mcp-server/examples/
+memory_navi/ros-mcp-server/docs/

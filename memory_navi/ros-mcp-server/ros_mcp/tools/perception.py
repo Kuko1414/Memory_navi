@@ -9,10 +9,13 @@
 - 单机项目：命名空间从环境变量 ROS_NAMESPACE 读，默认 agent0（不让 LLM 传参）。
 """
 
+import base64
+import json
 import math
 import os
 import time
 
+import numpy as np
 from fastmcp import FastMCP
 
 from ros_mcp.utils.websocket import WebSocketManager, parse_input
@@ -256,5 +259,104 @@ def register_perception_tools(mcp: FastMCP, ws_manager: WebSocketManager) -> Non
                             "valid_cols": len(valid),
                         }
                 return {"error": f"Timeout waiting for {topic} (is depth_summary_relay.py running?)"}
+            finally:
+                ws_manager.send({"op": "unsubscribe", "topic": topic})
+
+    @mcp.tool(
+        description=(
+            "Read ONE full depth frame and compute per-ROI depth stats in meters, for a batch of "
+            "normalized bounding boxes. Use this to let CODE size up objects a vision model marked "
+            "with an ROI (the model only outputs the box; geometry is computed here). "
+            "rois_json is a JSON list like [{\"x\":0.1,\"y\":0.2,\"w\":0.3,\"h\":0.4}, ...] with "
+            "x,y = top-left and w,h = width,height, all normalized 0~1 (0~1000 also accepted). "
+            "Returns {ok, n, stats:[{median_m,min_m,max_m,near_min_m,near_max_m,n_valid}, ...]} aligned "
+            "to the input order; near_min/near_max is the depth cluster the ROI center sits in (background "
+            "separated by a gap is excluded), so near_max-near_min ~= object thickness. A null stat means "
+            "no valid depth in that ROI. Reads /<ns>/camera/depth/image (32FC1 meters)."
+        ),
+    )
+    def depth_roi(rois_json: str, timeout: float = 2.5, gap_thresh_m: float = 0.30) -> dict:
+        """读一帧 /<ns>/camera/depth/image，对一批归一化 ROI 批量算深度统计（方法B尺寸的底层）。"""
+        ns = DEFAULT_NAMESPACE
+        topic = f"/{ns}/camera/depth/image"
+        msg_type = "sensor_msgs/msg/Image"
+        try:
+            rois = json.loads(rois_json) if isinstance(rois_json, str) else rois_json
+        except (ValueError, TypeError):
+            return {"ok": False, "error": "rois_json must be a JSON list of {x,y,w,h}"}
+        if not isinstance(rois, list) or not rois:
+            return {"ok": False, "error": "rois_json must be a non-empty JSON list"}
+        try:
+            timeout = float(timeout)
+        except (ValueError, TypeError):
+            timeout = 2.5
+
+        def _frac(r):
+            x = float(r.get("x", 0) or 0); y = float(r.get("y", 0) or 0)
+            w = float(r.get("w", 0) or 0); h = float(r.get("h", 0) or 0)
+            if max(abs(x), abs(y), abs(w), abs(h)) > 1.5:   # 0~1000 量纲容错
+                x, y, w, h = x / 1000.0, y / 1000.0, w / 1000.0, h / 1000.0
+            return x, y, w, h
+
+        def _stats_for(depth, H, W, r):
+            x, y, w, h = _frac(r)
+            u0 = max(0, min(W - 1, int(round(x * W))))
+            u1 = max(u0 + 1, min(W, int(round((x + w) * W))))
+            v0 = max(0, min(H - 1, int(round(y * H))))
+            v1 = max(v0 + 1, min(H, int(round((y + h) * H))))
+            patch = depth[v0:v1, u0:u1].ravel()
+            vals = patch[(patch > 0.05) & (patch < 9.5)]
+            if vals.size == 0:
+                return None
+            vals = np.sort(vals)
+            median = float(np.median(vals))
+            # 1) 按 gap 切簇，取包含 median 的那簇 → 剔掉与前景明显分离的远背景斑块
+            if vals.size == 1:
+                band = vals
+            else:
+                splits = np.where(np.diff(vals) > gap_thresh_m)[0]
+                clusters = np.split(vals, splits + 1)
+                band = next((c for c in clusters if c[0] <= median <= c[-1]),
+                            max(clusters, key=len))
+            # 2) 簇内再用稳健分位数 p15/p85 修剪连续地面/墙的深度斜坡尾巴（否则厚度=整跨度虚大）
+            near_min = float(np.percentile(band, 15))
+            near_max = float(np.percentile(band, 85))
+            # median 也改用簇内中位（更贴物体表面，少受远背景拉偏）
+            median = float(np.median(band))
+            return {
+                "median_m": round(median, 3),
+                "min_m": round(float(vals[0]), 3),
+                "max_m": round(float(vals[-1]), 3),
+                "near_min_m": round(near_min, 3),
+                "near_max_m": round(near_max, 3),
+                "n_valid": int(vals.size),
+            }
+
+        with ws_manager:
+            if ws_manager.send({"op": "subscribe", "topic": topic, "type": msg_type,
+                                "queue_length": 1, "throttle_rate": 0}):
+                return {"ok": False, "error": f"Failed to subscribe {topic}"}
+            end = time.time() + timeout
+            try:
+                while time.time() < end:
+                    response = ws_manager.receive(timeout=0.5)
+                    if response is None:
+                        continue
+                    md, _ = parse_input(response, False)
+                    if not md or md.get("op") != "publish" or md.get("topic") != topic:
+                        continue
+                    msg = md.get("msg", {}) or {}
+                    data = msg.get("data", "")
+                    if not data:
+                        return {"ok": False, "error": "empty depth frame"}
+                    raw = np.frombuffer(base64.b64decode(data), dtype=np.float32)
+                    H, W = int(msg["height"]), int(msg["width"])
+                    if raw.size < H * W:
+                        return {"ok": False, "error": f"depth size {raw.size} < {H}x{W}"}
+                    depth = raw[:H * W].reshape(H, W)
+                    stats = [_stats_for(depth, H, W, r) if isinstance(r, dict) else None
+                             for r in rois]
+                    return {"ok": True, "n": len(stats), "width": W, "height": H, "stats": stats}
+                return {"ok": False, "error": f"Timeout waiting for {topic} (is the depth camera publishing?)"}
             finally:
                 ws_manager.send({"op": "unsubscribe", "topic": topic})

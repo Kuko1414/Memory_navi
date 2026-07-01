@@ -220,17 +220,27 @@ INSPECT_SYS = (
     "你是室内机器人的语义记录员，只做语义、不做导航。代码已把你移动并停在某处。\n"
     "给你：当前相机画面、激光障碍摘要(scan)、深度每列距离(depth，左→右，米，-1=该列无效)。\n"
     "任务：\n"
-    "1) 如实列出你在画面里确实看到的显著物体（家具/物品/结构皆可）。\n"
+    "1) 如实列出你在画面里确实看到的【独立家具/设备/可移动物品】。\n"
     "2) 描述画面里哪些方向的地面看起来开阔、可安全通行。\n"
-    "规则：\n"
-    "- 每个物体给 name、bearing(left/center/right)、bbox_center(Qwen 归一化坐标 [x0-1000,y0-1000]，取物体中心)、confidence(0-1)。\n"
-    "- 【不要自己报距离】——距离由系统按 bearing 从深度图读取，你只需把方位和像素坐标判断准。\n"
-    "- 只报确实看清的；看不清/没把握/被遮挡就不要列，宁缺勿编。\n"
-    "- 绝不列画面里没有的、或『猜应该有』的东西；按外观如实命名，区分外观相近的家具。\n"
-    "- passable: [{direction:left/center/right, free:true/false, note:\"\"}] —— 哪侧地面开阔可前进、哪侧被家具/墙挡住。\n"
+    "命名规则（重要）：\n"
+    "- 一律用【规范的中文通用单数名】：沙发/显示器/办公桌/办公椅/柜子/绿植/厨台/水槽/键盘/吊灯 等。\n"
+    "- 同一类物体每次都用【同一个名字】，不要换着叫（如别一会儿『柜子』一会儿『橱柜/抽屉柜/红色柜门』）；\n"
+    "  颜色/位置写进 spatial 描述，不要塞进名字。看不准具体类别时用最接近的通用类名。\n"
+    "【绝对不要记】：\n"
+    "- 墙面/地板/天花板/踢脚线/梁/隔断矮墙 等【建筑表面】；阴影/反光/光斑等视觉假象；\n"
+    "- 机器人【自身】可见的轮子/机身/底盘（名字含 机器人/机器人本体/robot/wheel/self 的一律不列）；\n"
+    "- 门/通道/开口【不要作为 objects 列出】（方向另在 passable 报）。\n"
+    "字段规则：\n"
+    "- 每个物体给 name、bearing(left/center/right)、bbox_center([x,y] Qwen 归一化 0-1000，物体中心)、\n"
+    "  roi({\"x\":,\"y\":,\"w\":,\"h\":} 物体外接框：左上角 x,y + 宽高 w,h，均 0-1000；要贴合物体本身，"
+    "不要把背景/远墙框进来——框大了尺寸会算错)、confidence(0-1)。\n"
+    "- 【不要自己报距离】——距离由系统按 bearing 从深度图读取，你只需把方位和框判断准。\n"
+    "- 只报确实看清的；看不清/没把握/被遮挡就不要列，宁缺勿编；绝不列『猜应该有』的东西。\n"
+    "- passable: [{direction:left/center/right, free:true/false, note:\"\"}] —— 哪侧地面开阔、哪侧被挡。\n"
     "- 若想看的东西明显偏在画面一侧，用 recenter_deg 给建议转向(+左/-右，度；不需要就 0)。\n"
     "只输出 JSON，不要其它文字：\n"
-    "{\"objects\":[{\"name\":\"\",\"bearing\":\"center\",\"bbox_center\":[500,500],\"confidence\":0}],"
+    "{\"objects\":[{\"name\":\"沙发\",\"bearing\":\"center\",\"bbox_center\":[500,500],"
+    "\"roi\":{\"x\":420,\"y\":430,\"w\":160,\"h\":140},\"confidence\":0.8}],"
     "\"passable\":[{\"direction\":\"left\",\"free\":true,\"note\":\"\"}],"
     "\"recenter_deg\":0,\"note\":\"\"}"
 )
@@ -313,10 +323,21 @@ def inspect_and_report(ex: Executor, *, area_hint: str = "", max_tokens: int = 1
         o = dict(o)
         o["distance_m"] = _band_distance(depths, o.get("bearing"))    # 代码接地
         o["distance_src"] = "depth_band"
-        # bbox_center: Qwen 归一化[0-1000] → 保留原值（调用方按需转像素）
+        # roi 规范化为 dict {x,y,w,h}（Qwen 可能给数组）；供代码算 size/abs_pose（贴物体的框）
+        roi = o.get("roi")
+        if isinstance(roi, (list, tuple)) and len(roi) == 4:
+            roi = {"x": roi[0], "y": roi[1], "w": roi[2], "h": roi[3]}
+        if isinstance(roi, dict) and all(k in roi for k in ("x", "y", "w", "h")):
+            o["roi"] = {k: float(roi[k]) for k in ("x", "y", "w", "h")}
+        else:
+            o.pop("roi", None)
+        # bbox_center: Qwen 归一化[0-1000]；缺失则用 roi 中心补（保持 completion 兼容）
         bc = o.get("bbox_center")
         if isinstance(bc, (list, tuple)) and len(bc) == 2:
             o["bbox_center"] = [round(float(bc[0])), round(float(bc[1]))]
+        elif isinstance(o.get("roi"), dict):
+            r = o["roi"]
+            o["bbox_center"] = [round(r["x"] + r["w"] / 2.0), round(r["y"] + r["h"] / 2.0)]
         grounded.append(o)
     passable = []
     for p in (obj.get("passable", []) or []):

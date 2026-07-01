@@ -10,6 +10,7 @@ from ros_mcp.tools.actions import register_action_tools
 from ros_mcp.tools.agent_actions import register_agent_action_tools
 from ros_mcp.tools.connection import register_connection_tools
 from ros_mcp.tools.images import register_image_tools
+from ros_mcp.tools.memory_tools import register_memory_tools
 from ros_mcp.tools.nodes import register_node_tools
 from ros_mcp.tools.parameters import register_parameter_tools
 from ros_mcp.tools.perception import register_perception_tools
@@ -42,6 +43,7 @@ def register_all_tools(
     register_connection_tools(mcp, ws_manager, rosbridge_ip, rosbridge_port)
     register_robot_config_tools(mcp, ws_manager)
     register_image_tools(mcp)
+    register_memory_tools(mcp, ws_manager)
     register_node_tools(mcp, ws_manager)
     register_parameter_tools(mcp, ws_manager)
     register_perception_tools(mcp, ws_manager)

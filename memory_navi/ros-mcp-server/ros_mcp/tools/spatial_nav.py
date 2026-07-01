@@ -89,8 +89,8 @@ def register_spatial_nav_tools(mcp:FastMCP, ws_manager:WebSocketManager):
         return {"in_memory":False,"name":object_name,"suggestion":"请调 RecordArea 登记此物体"}
 
     # ===== lookup_by_position =====
-    @mcp.tool(description="Find object by bearing+depth. Returns {id,name} or {is_new:true}. Tolerance ~0.3m.")
-    def lookup_by_position(bearing:str, depth_m:float)->dict:
+    @mcp.tool(description="Find object by bearing+depth in a given area. Returns {id,name} or {is_new:true}. Tolerance ~0.3m.")
+    def lookup_by_position(bearing:str, depth_m:float, area:str="break_room")->dict:
         try: depth_m=float(depth_m); bearing=(bearing or "center").lower()
         except: return {"error":"bearing string, depth_m number"}
         pose=_pose()
@@ -98,7 +98,7 @@ def register_spatial_nav_tools(mcp:FastMCP, ws_manager:WebSocketManager):
         offset={"left":25,"center":0,"right":-25}.get(bearing,0)
         ang=math.radians(pose["yaw_deg"]+offset)
         wx=pose["x"]+depth_m*math.cos(ang); wy=pose["y"]+depth_m*math.sin(ang)
-        rec=_load_mem("break_room")
+        rec=_load_mem(area)
         best=None; best_d=0.5
         for o in (rec.get("objects",[]) if rec else []):
             ap=o.get("abs_pose")
@@ -113,11 +113,11 @@ def register_spatial_nav_tools(mcp:FastMCP, ws_manager:WebSocketManager):
         "direction=left|right|front. Distance auto-computed from depth 3x3 patch. "
         "Returns target coords — caller should use geo_goto to execute navigation."
     ))
-    def nav_distance(object_name:str, u:int, v:int, direction:str)->dict:
+    def nav_distance(object_name:str, u:int, v:int, direction:str, area:str="break_room")->dict:
         try: u=int(u); v=int(v); direction=(direction or "front").lower()
         except: return {"error":"u,v int, direction string"}
         if direction not in DIR_OFFSET: return {"error":f"direction must be {list(DIR_OFFSET.keys())}"}
-        obj=_find_obj("break_room",object_name)
+        obj=_find_obj(area,object_name)
         if not obj: return {"ok":False,"reason":"not_in_memory","object_name":object_name,
                              "suggestion":"请先调 RecordArea 登记此物体"}
         dist_m=_depth_patch(u,v)
@@ -130,9 +130,9 @@ def register_spatial_nav_tools(mcp:FastMCP, ws_manager:WebSocketManager):
                 "dist_used_m":round(dist_m,2),"pixel":[u,v]}
 
     # ===== NavObject =====
-    @mcp.tool(description="Navigate to open space between two known objects.")
-    def nav_object(obj_a:str, obj_b:str, standoff_m:float=2.0)->dict:
-        a=_find_obj("break_room",obj_a); b=_find_obj("break_room",obj_b)
+    @mcp.tool(description="Navigate to open space between two known objects in a given area.")
+    def nav_object(obj_a:str, obj_b:str, standoff_m:float=2.0, area:str="break_room")->dict:
+        a=_find_obj(area,obj_a); b=_find_obj(area,obj_b)
         if not a: return {"ok":False,"reason":"not_in_memory","object_name":obj_a}
         if not b: return {"ok":False,"reason":"not_in_memory","object_name":obj_b}
         mx,my=(a["abs_pose"]["x"]+b["abs_pose"]["x"])/2,(a["abs_pose"]["y"]+b["abs_pose"]["y"])/2
@@ -142,18 +142,18 @@ def register_spatial_nav_tools(mcp:FastMCP, ws_manager:WebSocketManager):
         return {"ok":True,"status":"target_computed","target":{"x":round(tx,2),"y":round(ty,2)}}
 
     # ===== RecordArea =====
-    @mcp.tool(description="Register new objects. Qwen fills id/name/confidence. Code fills coords later.")
-    def record_area(objects_spec:str)->dict:
+    @mcp.tool(description="Register new objects into an area's memory. Qwen fills id/name/confidence; "
+                          "abs_pose preserved if provided (else null, filled later by geometry).")
+    def record_area(objects_spec:str, area:str="break_room")->dict:
         import datetime
         try: objs=json.loads(objects_spec) if isinstance(objects_spec,str) else objects_spec
         except: return {"error":"objects_spec must be valid JSON array"}
-        area="break_room"
         rec=_load_mem(area) or {"area":area,"type":"","summary":"","objects":[]}
         for o in (objs or []):
             if not isinstance(o,dict) or not o.get("name"): continue
             rec["objects"].append({"id":o.get("id",""),"name":o["name"],
-                "confidence":float(o.get("confidence",0.6)),"abs_pose":None})
+                "confidence":float(o.get("confidence",0.6)),
+                "abs_pose":o.get("abs_pose")})   # 保留调用方已算的坐标，没有则 null
         rec["observed_at"]=datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
         _save_mem(area,rec)
-        return {"ok":True,"registered":len(objs or []),
-                "note":"abs_pose 将在下轮观测时由系统自动补全"}
+        return {"ok":True,"registered":len(objs or []),"area":area}

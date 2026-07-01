@@ -81,7 +81,7 @@
   旧 Streamlit `vllm_chat_ui.py` 已移除。
 
 ### `memory_navi/` — 主系统
-- **`ros-mcp-server/`** — FastMCP ↔ ROS2 桥（已部署）。`server.py`/`ros_mcp/main.py` 入口（streamable-http :9000）；`ros_mcp/tools/*`（topics/services/actions/nodes/parameters/images/connection + **新增 `perception.py::scan_summary` 全精度→标量**、**`agent_actions.py`**：`move`/`turn_left_deg`/`turn_right_deg`/`stop`/`look`/`get_pose`/`navigate_to`，move/turn 为**闭环读真值位姿**、safety-shm 兜停，新文件 additive 不动上游）；`ros_mcp/utils/websocket.py`（rosbridge + 图像存盘；**注意 `receive` 超时即 close 连接丢订阅**）；`probe_topics.py` 验证。
+- **`ros-mcp-server/`** — FastMCP ↔ ROS2 桥（已部署）。`server.py`/`ros_mcp/main.py` 入口（streamable-http :9000）；`ros_mcp/tools/*`（topics/services/actions/nodes/parameters/images/connection + **`perception.py`**：`scan_summary`(全精度→标量)/`depth_summary`(每列中位深度)/**`depth_roi(rois_json)`**(读一帧 depth 批量算 ROI 深度统计：median/min/max/近带 p15-p85，供方法B尺寸) + **`agent_actions.py`**：`move`/`turn_left_deg`/`turn_right_deg`/`stop`/`look`/`get_pose`/`navigate_to`(闭环读真值位姿、safety-shm 兜停) + **`spatial_nav.py`**：`if_in_memory`/`lookup_by_position`/`nav_distance`/`nav_object`/`record_area` + **`memory_tools.py`（Qwen/Claude 共用）**：`read_area_memory`/`upsert_object`(数组字段 union 合并)/`get_room_boundary`/`list_areas`，新文件 additive 不动上游）；`ros_mcp/utils/websocket.py`（rosbridge + 图像存盘；**注意 `receive` 超时即 close 连接丢订阅**）；`probe_topics.py` 验证。
 - **`controll/controll/agent_core/`** — 薄 agent 核心（执行者编排 + 记忆作者）：
   - `config.py` — 端点/模型/路径/阈值集中配置。
   - `llm_client.py` — vLLM OpenAI client 工厂（proxy-safe）+ `resolve_model`。
@@ -90,11 +90,16 @@
   - `tool_loop.py` — `run_tool_loop(...)`：非流式 function-call 循环，工具图像作 user image turn 回灌；`tool_choice` 已参数化（vLLM hermes 不支持 `"required"`）。
   - `executor.py` — `Executor`：复用上面件，allowlist 只暴露精选动作工具，`run(brief,...)` 留 supervisor 注入口；`call_timeout` 120s（闭环 move 慢）。
   - `harness.py` — Qwen 规划器(`plan_task` 结构化子目标)→ 代码执行器(`execute_step` move/turn 闭环+真值核验、report 强制 look)；感知反馈环 `explore_and_report`(看→决策→执行→核验)。
-  - `cloud/schema.py` — C 格式 JSON Schema + `validate_memory_record`。
-  - `cloud/providers.py` — `AnthropicProvider`(主, system+tool-use 强制 JSON) / `LocalVLMProvider`(4B 回退)。
-  - `cloud/memory_author.py` — `MemoryAuthor.record()`：抓图→标注→校验→写区域 json。
+  - `cloud/schema.py` — C 格式 JSON Schema + `validate_memory_record`；物体含 `id/aliases/abs_pose/size/roi/confidence/verified_by`；`boundary` 房间粗边界；`TOOL_RECORD_SCHEMA`(严格版逼模型列物体)。
+  - `cloud/providers.py` — `AnthropicProvider`(主，**纯 JSON 主路径**：网关 tool_use 回空 objects，故纯 JSON 列全；tool_use 为次) / `LocalVLMProvider`(本地 VLM 回退)。`SYSTEM_RECORD_JSON` 已收紧：只记离散家具/设备、不记墙地影/机器人自身、规范单数命名。
+  - `cloud/memory_author.py` — `MemoryAuthor.record()`：抓图→标注→**`_backfill_geometry`(读一帧 `depth_roi`→填 size+abs_pose，深度无效留 null)**→校验→写区域 json；hazard 字符串元素自动包 `{note}`。
+  - `geometry/depth_projection.py` — 内参反投 `back_project`(像素+depth→map)；**方法B尺寸 `roi_to_size`/`roi_center_pixel`**(模型标 ROI、代码算 3D size)；**方法a `boundary_from_points`**(走过点+墙点 bbox)；`derive_observation_point`(绕到物体后/前)。`DEFAULT_K` fx=fy=253.9 cx=320 cy=240。
+  - `navigator.py` — 代码导航：`geo_step_open`(VFH 反应式开放扇区步进，核心)/`geo_goto_around`/`geo_face_point`/`bearing_deg`。
   - `memory/fs_memory.py` — 文件系统 STG：`load_area/upsert_area/topology_path(BFS)`/原子写。
-  - 🟡 `harness.py` 是 supervisor 雏形（规划+核验+探索环）；⬜ 仍未建：`supervisor.py`（6 规则）、`skills/`、`memory/memory_tools.py`、几何导航 `goto(x,y)`。
+  - 🟡 `harness.py`+`navigator.py` 是 supervisor 雏形（规划+核验+代码导航）；⬜ 仍未建：`supervisor.py`（6 规则）、`skills/`、几何导航 `goto(x,y)` 工具化。
+- `controll/controll/explore_probe.py` — **初探模式**（未知房间从零探索）：代码网格 frontier 覆盖(`PITCH=1.4m`，撞墙标 blocked) + Qwen 顾问(`_advisor` 报门/开口、只重排未覆盖格不否决) + Claude 每视角 C-format 标注 + boundary/doors 写回。
+- `controll/controll/autonomy_probe.py` — **补全模式**（区域已知）：Phase A 锚点定位 → Phase B VFH 绕到目标后方 → Phase C 主动环视。无 GT 已 PASS。
+- `controll/controll/dual_collab_test.py` — Qwen↔Claude 共享记忆协作验证（都走 `upsert_object`，验不互擦/格式一致/可合并）。`geom_backfill_test.py` — 几何回填(size+abs_pose)验证。
 - `controll/controll/slice_demo.py` — **垂直切片入口**（Proof1: Qwen FC+MCP 读 topic；Proof2: Claude 观察图→写 C 记忆）。`control.py` 仍是桩。
 - `controll/controll/executor_smoke.py` — 执行器冒烟（Qwen 经精选工具多步动作）。`controll/test/test_executor.py` — 执行器接线单测。
 - `Report/harness_eval.md` + `Report/break_room_ground_truth.json` — harness 评估报告（幻觉 vs 不收敛）+ 评估答案 key。

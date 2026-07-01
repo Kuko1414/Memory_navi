@@ -16,7 +16,7 @@ import anthropic
 from .. import config
 from ..image_utils import to_anthropic_image_block, to_openai_image_url
 from ..llm_client import make_vllm_client, resolve_model
-from .schema import MEMORY_RECORD_SCHEMA
+from .schema import MEMORY_RECORD_SCHEMA, TOOL_RECORD_SCHEMA
 
 RECORD_TOOL = {
     "name": "record_memory",
@@ -27,7 +27,7 @@ RECORD_TOOL = {
         "不要只把物体写进 summary —— summary 是概述，objects 才是结构化清单，二者都要给。"
         "不要臆造绝对坐标 abs_pose 与精确 distance_m —— 留 null，它们由几何管线（深度/TF）回填。"
     ),
-    "input_schema": MEMORY_RECORD_SCHEMA,
+    "input_schema": TOOL_RECORD_SCHEMA,   # 严格版：objects required + minItems，逼模型列物体
 }
 
 
@@ -36,6 +36,21 @@ SYSTEM_RECORD = (
     "硬性要求：objects 必须是非空数组，把画面中每一个能辨认的显著物体各列一条（每条至少有 name）。"
     "严禁把物体仅写进 summary 而留空 objects——summary 是概述，objects 是结构化清单，两者都必须给。"
     "abs_pose / abs_pose_delta_m / view.distance_m 一律填 null（不要从单帧 RGB 猜测米制坐标/距离）。"
+)
+
+# 纯 JSON 路径专用 system（不提工具——实测网关用 tool_use 会回空 objects，纯 JSON 才列得全）。
+SYSTEM_RECORD_JSON = (
+    "你是室内机器人的『记忆作者』。看这张相机图，把画面里【独立的家具/设备/可移动物体】逐个列出。\n"
+    "只输出一个合法 JSON 对象（不要代码块标记、不要任何解释）：\n"
+    "{\"area\":\"\",\"type\":\"区域类型如 office/lounge\",\"summary\":\"一句话概述\","
+    "\"objects\":[{\"name\":\"\",\"spatial\":\"定性相对位置\",\"roi\":{\"x\":0,\"y\":0,\"w\":0,\"h\":0},"
+    "\"confidence\":0.8,\"abs_pose\":null}]}\n"
+    "【只记离散物体】：桌、椅、沙发、柜、显示器、绿植、灯具、门 等。\n"
+    "【不要记】：墙面/地板/天花板/踢脚线/梁/转角等建筑表面；阴影/反光/光斑等视觉假象；"
+    "以及机器人【自身】可见的轮子/机身部件（名字含 robot/wheel/self 的一律不列）。\n"
+    "【命名规范】：用规范单数通用名（多台显示器统一都叫 monitor，不要拆成 monitor_left/monitor_center）；"
+    "靠 spatial 区分位置，不要靠名字后缀把同类物体拆成多条。\n"
+    "硬性要求：objects 必须非空；roi 用归一化 0~1；abs_pose 一律 null（不要猜米制坐标，由几何管线回填）。"
 )
 
 
@@ -52,6 +67,14 @@ def _build_prompt(context: dict) -> str:
         "例如看到桌子和杯子就输出 objects:[{\"name\":\"desk\",\"spatial\":\"正前方桌台\",\"confidence\":0.8},{\"name\":\"cup\",\"spatial\":\"桌面右侧\",\"confidence\":0.6}]。",
         "务必：abs_pose / abs_pose_delta_m / view.distance_m 一律留 null（不要从单帧 RGB 猜测米制坐标/距离）。",
     ]
+    known_objs = context.get("known_objects") or []
+    if known_objs:
+        lines.append(
+            "【已记录物体】（本房间此前视角已登记，避免重复）："
+            + "、".join(str(n) for n in known_objs[:40]) + "。")
+        lines.append(
+            "只补充画面里【尚未记录】的新物体；上面已记录过的同类同位物体不要再重复列出"
+            "（除非这次能看得更清、提供更准的 spatial/roi）。这样可避免同一物体被反复登记。")
     if context.get("schema_error"):
         lines.append(f"上次输出不符合 schema（{context['schema_error']}），请修正后重新输出。")
     return "\n".join(lines)
@@ -66,49 +89,37 @@ class AnthropicProvider:
         self._max_tokens = max_tokens or config.ANTHROPIC_MAX_TOKENS
 
     def annotate(self, image, context: dict) -> dict:
-        kwargs = {
-            "model": self._model,
-            "max_tokens": self._max_tokens,
-            "system": SYSTEM_RECORD,
-            "tools": [RECORD_TOOL],
-            "messages": [{
-                "role": "user",
-                "content": [to_anthropic_image_block(image), {"type": "text", "text": _build_prompt(context)}],
-            }],
-        }
-        # 网关代理模型常拒绝 tool_choice="auto" 字符串（需 internally tagged enum）或强制 tool。
-        # 策略：先不传 tool_choice（默认 auto），失败/无 tool_use 再先后试 forced 与无 tools。
-        for tries, (tc, use_tools) in enumerate((
-            (None, True),                                    # 默认 auto
-            ({"type": "tool", "name": "record_memory"}, True),  # 强制（原生 Claude）
-            (None, False),                                   # 无工具（纯 text）
-        )):
-            try:
-                call_kw = dict(kwargs)
-                if tc is not None:
-                    call_kw["tool_choice"] = tc
-                if not use_tools:
-                    call_kw.pop("tools", None)
-                    call_kw["system"] = SYSTEM_RECORD + "\n你的输出必须是一份合法 JSON 对象。不要加任何解释，只输出 JSON。"
-                resp = self._client.messages.create(**call_kw)
-                for block in resp.content:
-                    if getattr(block, "type", None) == "tool_use" and block.name == "record_memory":
-                        return dict(block.input)
-                # 无 tool_use → 从 text 里抠 JSON
-                for block in resp.content:
-                    if getattr(block, "type", None) == "text":
-                        m = re.search(r"\{.*\}", (block.text or ""), re.DOTALL)
-                        if m:
-                            try:
-                                return json.loads(m.group(0))
-                            except (json.JSONDecodeError, TypeError):
-                                continue
-                if tries == 0:
-                    continue  # auto 没调工具→ 下轮 forced
-            except Exception:  # noqa: BLE001
-                if tries < 2:
-                    continue
-                raise
+        """主路径：纯文本 JSON（实测网关用 tool_use 会回空 objects，纯 JSON 能列全物体）。
+        次路径：tool_use（原生 Claude 环境）。"""
+        msg = [{
+            "role": "user",
+            "content": [to_anthropic_image_block(image), {"type": "text", "text": _build_prompt(context)}],
+        }]
+        # —— 主：纯 JSON（不带 tools）——
+        try:
+            resp = self._client.messages.create(
+                model=self._model, max_tokens=self._max_tokens,
+                system=SYSTEM_RECORD_JSON, messages=msg)
+            txt = "".join(b.text for b in resp.content if getattr(b, "type", None) == "text")
+            obj = _extract_json(txt)
+            if isinstance(obj, dict) and obj.get("objects"):
+                return obj
+        except Exception:  # noqa: BLE001
+            obj = None
+        # —— 次：tool_use（原生 Claude 强制结构化）——
+        try:
+            resp = self._client.messages.create(
+                model=self._model, max_tokens=self._max_tokens, system=SYSTEM_RECORD,
+                tools=[RECORD_TOOL], tool_choice={"type": "tool", "name": "record_memory"}, messages=msg)
+            for block in resp.content:
+                if getattr(block, "type", None) == "tool_use" and block.name == "record_memory":
+                    return dict(block.input)
+        except Exception:  # noqa: BLE001
+            pass
+        # 兜底：返回主路径拿到的（可能 objects 空）或抛错
+        if isinstance(obj, dict):
+            return obj
+        raise RuntimeError("AnthropicProvider.annotate 未能产出 JSON")
         raise RuntimeError("Anthropic annotate 三路尝试均失败")
 
     def strategic_guidance(self, payload: dict) -> dict:

@@ -143,3 +143,70 @@
 
 ### 工程（自修）
 - **Q15** topic 冲突已修 · **Q18** relays 写 start_all.sh · **Q19** bash 默认去 conda · **Q8** twist_mux 记待办
+
+---
+
+## 7.1 初探稳定化：改用 Qwen 作者 + 客观召回打分（阶段九续）
+
+- **打分地基**：`Report/score_explore.py`（召回=位置≤1m 且类别命中/该区可见真值；报命中/漏记/误标/幻觉）
+  + `Report/explore_room_ground_truth.json`（break_room 全屋真值 + observable 分母标记）。修 **A3 实锤 bug**：
+  aliases 合并未去重（曾两次 `red_cabinet`）→ 归一化去重、剔除等于主名。
+- **作者对比（用户"谁准用谁"）**：同帧序列 **Qwen 54.5% > Claude 36.4%**（Claude 英文乱标、方差大；Qwen 原生中文、免费）。
+  **GPT 端点 = Codex/ChatGPT-账户代理，只放行 codex 模型、视觉调用全 500 → 不可用**。
+  → explore **改用本地 Qwen 作者**（inspect 出物体+ROI，代码 depth_roi 回填几何、去重整理），**移除 Claude 云调用**。
+- **稳定化改动**：**C1** `INSPECT_SYS` 强制规范中文单数名 + 禁墙/地/天花板/自身/门 + 给 ROI（名字全清洁，16 条噪声清零）；
+  **A4** `_dedup_objects` 加 `_name_compat`（只并同类，桌椅不再并坨）+ `DEDUP_M 0.7→0.6`；
+  **A6** `MAX_VANTAGES 16→26` + `MIN_VANTAGE_SPACING_M=1.0`（整屋覆盖 + 止住原地重扫）；
+  **A7** `_validate_doors`（count≥2 + 近周界，16→5 门）；**A2** size 任一维>2.5m 标 `size_unreliable` 置 null；
+  **B1** `_merge_obj_pair` 几何字段取**更近帧**（非高置信更远帧）。删死代码 `EXPLORE_SYS/_explore_decide/_quadrants/_pixel_to_world`。
+- **验收**：scope=整个 break_room、多区同一 `area.json`。**召回 55%→65%(13/20)**，达用户"至少 13-15"下限；名字全清洁、门已校验。
+  单测 `test_explore_stable.py` 9 项全绿。**教训**：跨帧命名发散是召回杀手（C1 强制规范名一举解决）；
+  名感知去重比纯位置去重关键（近距不同类家具不能并）；几何字段应按**距离**融合(近帧准)而非置信度。
+  残留：SW 密集角 6 近似矮盒分不出；覆盖会往空旷远区乱跑浪费 vantage；跨轮需 Webots `Ctrl+Shift+R` 复位车。
+  关联 [[layered-harness-code-nav-vlm-semantics]] [[no-answer-leak-to-qwen]] [[dual-model-shared-memory-merge]]。
+
+---
+
+## 6.30 共享记忆 + 几何回填 + 初探重写（阶段九）
+
+### 统一记忆 & 双模型协作
+- **MCP 记忆工具共用**：`memory_tools.py` 注册 `read_area_memory/upsert_object/get_room_boundary/list_areas`，
+  Qwen 与 Claude 同一份本地 `area.json` 读写。物体规范字段：id/name/aliases/abs_pose/size/roi/confidence/verified_by。
+- **一个写一个擦（已修）**：`upsert_object` 原用 `dict.update()` **整字段覆盖**，Claude 写 `verified_by` 擦掉 Qwen 的。
+  改为**数组字段(verified_by/aliases/affordance)并集、标量覆盖**。`dual_collab_test.py` 验证：同物两模型 verified_by
+  并存、按 name 合并不重复。**教训：多写者共享记录时，数组字段必须 union 语义，不能 last-writer-wins。**
+
+### 几何回填（方法B size + 方法a boundary）
+- **分工**：模型只标 ROI，**代码算几何**（用户："没必要让模型来算"）。`depth_roi` MCP 工具读一帧 depth 批量算 ROI 深度统计；
+  `depth_projection.roi_to_size/roi_center_pixel/boundary_from_points`；`MemoryAuthor._backfill_geometry` 填 size+abs_pose。
+- **厚度坑（已修）**：ROI 含连续地面/墙的深度斜坡时，min-max 厚度被拉到整跨度（沙发"厚 5.5m"）。
+  改 **gap 切簇取含 median 那簇 + 簇内 p15/p85 分位数**修剪 → 0.85m。
+- **视角硬约束（非 bug）**：机器人相机仅 0.21m，桌面物体（显示器）bbox 越过桌面看到**远墙**，depth 不是物体表面 →
+  size 虚大、abs_pose 偏。数学修不了，**深度无效的对象 size/abs_pose 留 null 不瞎编**（实测 8/9 填、null 的都对）。
+- **Claude 结构化**：网关用 tool_use 回空 objects → `AnthropicProvider.annotate` 改**纯 JSON 主路径**。
+- **schema 修**：`view_pose` 键 `yaw_deg`→`yaw`（否则 record 校验失败丢整帧）。
+
+### 初探模式（explore_probe）重写 — 代码 frontier + Qwen 顾问 + Claude 语义
+- **P1 Qwen 选视角→原地打转（核心，已修）**：让 Qwen 选"去哪看"会卡死（8 步 5 步强制脱困、没出起点 2m 盒）。
+  **正解=代码持有覆盖保证**：`PITCH=1.4m` 网格 frontier 从起点铺开、VFH 开过去、撞墙格标 blocked、覆盖完才停。
+  **Qwen 降为顾问**（`_advisor`）：只报门/开口方向给代码**重排未覆盖格优先级**，删不掉格、停不了覆盖。
+  **回答"Qwen 要彻底退出导航吗"——不，降为顾问（建议方向+标门），代码兜底覆盖。** 重跑覆盖 7.2×6.8m、0 卡死。
+- **P2 hazard 字符串崩记录（已修）**：Claude 返回 `hazards:["..."]`（字符串）不符 schema 对象 → 丢整帧标注。
+  `_finalize` 把字符串 hazard 包成 `{note:str}`。
+- **P3 记忆噪声（已修）**：44 物体含 19 墙地影/反光 + 2 自观测(robot_body) + 显示器拆 5 条。
+  `SYSTEM_RECORD_JSON` 收紧：只记离散家具/设备，不记建筑表面/视觉假象/机器人自身部件，规范单数命名。重跑 9 个干净物体。
+- 入口：`explore_probe.py`(初探) / `autonomy_probe.py`(补全) / `dual_collab_test.py` / `geom_backfill_test.py`。
+  关联 [[dual-model-shared-memory-merge]] [[harness-hallucination-vs-convergence]] [[layered-harness-code-nav-vlm-semantics]]。
+
+### 初探模式三类修复（覆盖收敛 / 环视 / 写盘正确性，同日续）
+- **覆盖 streak 根因**：`_pick_target` 的 Qwen-hint 优先级是**绝对二元**（命中提示锥碾压所有非提示格、无视距离）→
+  一直追"门在前方"往北 streak、东半区不探、卡死。**修=距离带为主键、hint 仅同距带 tiebreak（近优先）**；
+  外加 **bbox 给 frontier 播种**（墙点扫到哪、远角就入 frontier）、终止改 covered/上限/卡死（删 BUDGET=8）、
+  撞墙 `_blocked_cone`(共线更远格一并 blocked)+净位移卡死检测+逃向最远格。**教训：让"顾问"用绝对优先级，等于又把决策权交回模型→退化成模型驱动 streak；顾问必须是不能跨越硬约束的弱信号。**
+- **几何校验去重（用户关键思路）**："据小车位姿+深度算出物体世界位置，重复(同位)就过滤/合并"。`_dedup_objects`：
+  可信物体(界内+地面高度带)按**世界位置**去重(跨命名同位=同物→合一、别名入 aliases)；不可信(高处/越界/无 abs_pose)按名归并+标 `size_unreliable`+坐标留 null；跨桶去重。**99 原始观测→18 干净物体（首跑 71 噪声）**。
+  **教训：单帧 depth 反投对高处/远物不可信(打到远墙)，位置去重前必须先按"高度带+边界"过滤不可信观测，否则同物散成多条。**
+- **空缺感知**：记录时把已记物体名 `known_objects` 喂记忆作者→只补缺口、不每帧重复登记（源头降噪，配合事后几何去重）。
+- **单一并集写路径**：`FsMemory.upsert_object`（数组并集+同名近=同实例/远=多实例），explore 落盘改逐物体 upsert（不再整条覆盖）；
+  门 `_cluster_doors` 世界点聚类去重 → 每门写 `topology.json` 边(to=占位未探区)。`MemoryAuthor.record` 加 `write=`/`known_objects=`。
+  关联 [[dual-model-shared-memory-merge]] [[observation-turn-look-design]] [[no-answer-leak-to-qwen]]。

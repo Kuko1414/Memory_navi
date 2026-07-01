@@ -164,6 +164,65 @@ def bearing_to_depth_column(bearing: str, depths: list) -> float:
 
 
 # ---------------------------------------------------------------------------
+# ROI → 3D 尺寸（方法B：模型只给 ROI，代码读 depth 帧算尺寸）
+# ---------------------------------------------------------------------------
+
+def _roi_to_frac(roi: dict) -> tuple:
+    """ROI 归一化到 0~1 (x,y,w,h)。容错：若任一值 >1.5 视为 0~1000 量纲，自动除以 1000。"""
+    x = float(roi.get("x", 0) or 0); y = float(roi.get("y", 0) or 0)
+    w = float(roi.get("w", 0) or 0); h = float(roi.get("h", 0) or 0)
+    if max(abs(x), abs(y), abs(w), abs(h)) > 1.5:
+        x, y, w, h = x / 1000.0, y / 1000.0, w / 1000.0, h / 1000.0
+    return x, y, w, h
+
+
+def roi_center_pixel(roi: dict, K: dict = None) -> tuple:
+    """ROI(归一化) 中心 → 像素(uc,vc)。供 back_project 求物体世界位姿。"""
+    K = K or DEFAULT_K
+    x, y, w, h = _roi_to_frac(roi)
+    uc = (x + w / 2.0) * K["width"]
+    vc = (y + h / 2.0) * K["height"]
+    uc = max(0.0, min(K["width"] - 1, uc))
+    vc = max(0.0, min(K["height"] - 1, vc))
+    return uc, vc
+
+
+def roi_to_size(roi: dict, stats: dict, K: dict = None) -> dict:
+    """ROI(归一化 0~1 bbox) + depth_roi 统计 → 3D 尺寸(米)。
+
+    针孔×深度：物体在该深度下，1 像素 = depth/f 米，故
+      width_m  = roi.w * W * median_d / fx
+      height_m = roi.h * H * median_d / fy
+    厚度(depth_m)用【近带聚类】范围 near_max - near_min（剔除 bbox 里混进的远背景）。
+    无有效深度则各字段 null。
+    """
+    K = K or DEFAULT_K
+    d = stats.get("median_m") if stats else None
+    if not d or d <= 0:
+        return {"width_m": None, "height_m": None, "depth_m": None}
+    _, _, w_frac, h_frac = _roi_to_frac(roi)
+    width_m = w_frac * K["width"] * d / K["fx"]
+    height_m = h_frac * K["height"] * d / K["fy"]
+    nmin, nmax = stats.get("near_min_m"), stats.get("near_max_m")
+    depth_m = (nmax - nmin) if (nmin is not None and nmax is not None and nmax >= nmin) else None
+    return {
+        "width_m": round(width_m, 3),
+        "height_m": round(height_m, 3),
+        "depth_m": round(depth_m, 3) if depth_m is not None else None,
+    }
+
+
+def boundary_from_points(points: list) -> dict:
+    """方法a 房间粗边界：走过点 + 墙点的轴对齐 bbox。points=[(x,y),...]。"""
+    xs = [float(p[0]) for p in points if p and len(p) >= 2]
+    ys = [float(p[1]) for p in points if p and len(p) >= 2]
+    if not xs or not ys:
+        return None
+    return {"xmin": round(min(xs), 2), "xmax": round(max(xs), 2),
+            "ymin": round(min(ys), 2), "ymax": round(max(ys), 2)}
+
+
+# ---------------------------------------------------------------------------
 # 目标推导
 # ---------------------------------------------------------------------------
 
