@@ -136,6 +136,137 @@ def test_scorer_recall_end_to_end(tmp_path=None):
                 os.remove(p)
 
 
+# ---------- 象限调度官（Claude Role-1）纯函数 ----------
+def test_recon_corners():
+    import explore_probe as ep
+    c = ep._recon_corners({"xmin": 0, "xmax": 5, "ymin": 0, "ymax": 4}, inset=0.8)
+    assert c == [(0.8, 0.8), (4.2, 0.8), (4.2, 3.2), (0.8, 3.2)], c
+    assert ep._recon_corners({"xmin": 0, "xmax": 1, "ymin": 0, "ymax": 4}, 0.8) == []  # 太窄→退化
+    assert ep._recon_corners(None) == []
+
+
+def test_quadrant_stats_undercover_and_allblocked():
+    import explore_probe as ep
+    bbox = {"xmin": -2.8, "xmax": 2.8, "ymin": -2.8, "ymax": 2.8}
+    cells = ep._bbox_cells(bbox)
+    ne = {c for c in cells if c[0] >= 0 and c[1] >= 0}
+    se = {c for c in cells if c[0] >= 0 and c[1] < 0}
+    visited = set(ne)                       # NE 全访问
+    blocked = set(se) | {(-2, -2)}          # SE 全 blocked；SW 只 blocked 一格(仍有开洞)
+    st = ep._quadrant_stats(bbox, visited, blocked, [])
+    assert st["NE"]["coverage"] == 1.0 and not st["NE"]["under_covered"]   # 全访问→不欠
+    assert st["SE"]["coverage"] == 1.0 and not st["SE"]["under_covered"]   # 全 blocked→不欠(不可达)
+    assert st["SW"]["under_covered"] and st["SW"]["coverage"] < 0.6        # 低覆盖+有开洞→欠
+    assert st["NW"]["under_covered"]                                       # 全开→欠
+
+
+def test_candidate_cells_reopen_flag():
+    import explore_probe as ep
+    bbox = {"xmin": -1.4, "xmax": 1.4, "ymin": -1.4, "ymax": 1.4}   # 3x3=9 格
+    ring = [c for c in ep._bbox_cells(bbox) if c != (0, 0)]         # (0,0) 的 8 邻居全访问
+    cands = ep._candidate_cells(bbox, set(ring), {(0, 0)})
+    assert len(cands) == 1 and cands[0]["cell"] == (0, 0) and cands[0]["reopen_blocked"]
+    # 全开：每象限 top-N 覆盖候选，无 reopen，id 唯一
+    cands2 = ep._candidate_cells(bbox, set(), set())
+    ids = [c["id"] for c in cands2]
+    assert len(ids) == len(set(ids)) and not any(c["reopen_blocked"] for c in cands2)
+
+
+def test_validate_plan_choice():
+    import explore_probe as ep
+    cands = [{"id": "c0", "cell": (1, 0)}, {"id": "c1", "cell": (2, 0)}]
+    assert ep._validate_plan_choice({"target_id": "c1"}, cands)["cell"] == (2, 0)
+    assert ep._validate_plan_choice({"target_id": "c9"}, cands) is None   # 幻觉 id
+    assert ep._validate_plan_choice({}, cands) is None
+    assert ep._validate_plan_choice({"target_id": None}, cands) is None
+    assert ep._validate_plan_choice("nope", cands) is None
+
+
+def test_is_forward_open():
+    import explore_probe as ep
+    # 前向锥(±30)内最近障碍在目标格之外(+margin) → 开
+    assert ep._is_forward_open({0: 3.0, 45: 0.2, -45: 0.3}, dist_to_cell=1.5)   # 45°在锥外不算
+    assert not ep._is_forward_open({0: 1.0}, dist_to_cell=1.5)                  # 障碍近于格→墙
+    assert not ep._is_forward_open({90: 5.0}, dist_to_cell=1.5)                 # 无前向读数→保守当墙
+    assert not ep._is_forward_open({}, dist_to_cell=1.0)
+
+
+def test_stop_rule_object_standoff():
+    import explore_probe as ep
+    cell = (2, 0)                       # 中心 (2.8, 0)
+    fb, tol = ep._stop_rule(cell, [("柜子", 2.8, 0.0)])   # 格上有物体
+    assert fb == ep.OBJECT_STANDOFF_M and tol > ep.OBJECT_STANDOFF_M
+    fb2, _ = ep._stop_rule(cell, [("柜子", 5.0, 5.0)])    # 远处物体→默认
+    assert fb2 == 0.4
+
+
+def test_min_vantage_spacing_ok():
+    import explore_probe as ep
+    assert ep._min_vantage_spacing_ok({"x": 0, "y": 0}, None)          # 首个总 OK
+    assert ep._min_vantage_spacing_ok({"x": 2, "y": 0}, (0.0, 0.0))    # 够远
+    assert not ep._min_vantage_spacing_ok({"x": 0.5, "y": 0}, (0.0, 0.0))  # 太近
+
+
+# ---------- Role-2：代码聚簇 → Claude 命名 → 代码合并 ----------
+def test_position_clusters():
+    import explore_probe as ep
+    recs = [{"name": "桌子", "abs_pose": {"x": 3.0, "y": 0.0}},
+            {"name": "办公桌", "abs_pose": {"x": 3.1, "y": 0.0}},   # 与 0 同簇(<0.6m)
+            {"name": "显示器", "abs_pose": {"x": 5.0, "y": 0.0}}]   # 远，独簇
+    cl = ep._position_clusters(recs)
+    idsets = sorted(sorted(ids) for ids, _cen in cl)
+    assert idsets == [[0, 1], [2]], idsets
+
+
+def test_consolidate_merge_synonyms():
+    import explore_probe as ep
+    recs = [{"name": "桌子", "abs_pose": {"x": 3.0, "y": 0.0}, "confidence": 0.7},
+            {"name": "办公桌", "abs_pose": {"x": 3.1, "y": 0.0}, "confidence": 0.8}]
+    cl = ep._position_clusters(recs)                              # 一个簇 {0,1}
+    out = ep._apply_consolidation(recs, cl, {"clusters": [{"id": 0, "name": "办公桌"}], "drop": []})
+    assert len(out) == 1 and out[0]["name"] == "办公桌", out       # 同物不同名→合一
+    assert "桌子" in (out[0].get("aliases") or [])
+
+
+def test_consolidate_keep_distinct_clusters():
+    import explore_probe as ep
+    recs = [{"name": "桌子", "abs_pose": {"x": 3.0, "y": 0.0}},
+            {"name": "椅子", "abs_pose": {"x": 5.0, "y": 0.0}}]    # 远→两簇
+    cl = ep._position_clusters(recs)
+    out = ep._apply_consolidation(recs, cl, {"clusters": [{"id": 0, "name": "办公桌"},
+                                                          {"id": 1, "name": "办公椅"}]})
+    assert sorted(o["name"] for o in out) == ["办公桌", "办公椅"]
+
+
+def test_consolidate_colocated_forces_one():
+    import explore_probe as ep
+    # 名字矛盾的记录挤在一簇(<0.6m) → 恒合并成一个物体（消除同位重名，不因名字矛盾拆分）
+    recs = [{"name": "办公桌", "abs_pose": {"x": 3.0, "y": 0.0}},
+            {"name": "柜子", "abs_pose": {"x": 3.2, "y": 0.0}}]
+    cl = ep._position_clusters(recs)
+    assert len(cl) == 1                                           # 确实同簇
+    out = ep._apply_consolidation(recs, cl, {"clusters": [{"id": 0, "name": "办公桌"}]})
+    assert len(out) == 1 and out[0]["name"] == "办公桌"
+
+
+def test_consolidate_drop_and_fallback():
+    import explore_probe as ep
+    recs = [{"name": "沙发", "abs_pose": {"x": 1.0, "y": 0.0}},
+            {"name": "ufo", "abs_pose": {"x": 5.0, "y": 0.0}},     # 独簇→drop
+            {"name": "绿植", "abs_pose": {"x": 9.0, "y": 0.0}}]    # 独簇, Claude 没判定→多数名兜底
+    cl = ep._position_clusters(recs)                              # 3 独簇 (id 0,1,2)
+    out = ep._apply_consolidation(recs, cl, {"clusters": [{"id": 0, "name": "沙发"}], "drop": [1]})
+    assert sorted(o["name"] for o in out) == ["沙发", "绿植"]      # ufo 删、绿植兜底保留
+
+
+def test_consolidate_empty_plan_noop():
+    import explore_probe as ep
+    recs = [{"name": "沙发", "abs_pose": {"x": 1.0, "y": 0.0}}]
+    cl = ep._position_clusters(recs)
+    assert ep._apply_consolidation(recs, cl, {}) == recs          # 空计划=安全降级
+    assert ep._apply_consolidation(recs, cl, "bad") == recs
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:

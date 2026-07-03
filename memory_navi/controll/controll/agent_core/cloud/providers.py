@@ -146,6 +146,106 @@ class AnthropicProvider:
                 raw += block.text
         return _extract_json(raw or "")
 
+    def plan_coverage(self, payload: dict) -> dict:
+        """Claude 象限调度官：探索覆盖规划（纯文本、不读图、结构性触发，非常规控制回路）。
+
+        代码递给它一张紧凑符号地图（bbox + 四象限覆盖统计 + 物体世界坐标 + **代码筛好的候选格**），
+        它只【从候选里选一个 id】指出下一步该去补哪个欠覆盖象限——绝不自己编坐标（防幻觉）。
+        返回 {done, target_quadrant, target_id, reopen, rationale}；任何异常/超时 → 返回 {} 当作跳过本轮。
+        """
+        try:
+            text = _build_plan_prompt(payload)
+            resp = self._client.messages.create(
+                model=self._model,
+                max_tokens=400,
+                system=SYSTEM_PLAN_COVERAGE,
+                messages=[{"role": "user", "content": text}],
+            )
+            raw = "".join(b.text for b in resp.content if getattr(b, "type", None) == "text")
+            obj = _extract_json(raw or "")
+            return obj if isinstance(obj, dict) else {}
+        except Exception:  # noqa: BLE001
+            return {}
+
+    def consolidate_memory(self, records: list) -> dict:
+        """Claude 记忆整理官（Role-2，探索写盘前一次，纯文本、不读图）。
+
+        records: [{id, name, x, y}, ...] —— 代码去重后仍可能同一物体被跨帧标成不同名。
+        Claude 只按 id【分组 + 规范命名 + 标幻觉】：同一物体的不同叫法(桌子/办公桌/工位)并一组、
+        不同类(桌子 vs 椅子)分开、明显不存在的放 drop。【绝不改坐标】——坐标由代码按组聚合。
+        返回 {groups:[{name, ids:[...]}], drop:[ids]}；任何异常/超时 → 返回 {} 当作跳过（安全降级）。
+        """
+        try:
+            text = _build_consolidate_prompt(records)
+            resp = self._client.messages.create(
+                model=self._model,
+                max_tokens=8192,   # 每物体一条 id 分组输出较长；给足以免截断成非法 JSON
+                system=SYSTEM_CONSOLIDATE,
+                messages=[{"role": "user", "content": text}],
+            )
+            if getattr(resp, "stop_reason", None) == "max_tokens":
+                print("⚠️ consolidate_memory 输出被 max_tokens 截断 → JSON 不完整，跳过整理")
+            raw = "".join(b.text for b in resp.content if getattr(b, "type", None) == "text")
+            obj = _extract_json(raw or "")
+            return obj if isinstance(obj, dict) else {}
+        except Exception as e:  # noqa: BLE001
+            print(f"⚠️ consolidate_memory 失败({type(e).__name__}: {str(e)[:80]}) → 跳过整理")
+            return {}
+
+
+SYSTEM_PLAN_COVERAGE = (
+    "你是室内机器人的【探索覆盖调度官】。你【看不到图像】——只收到代码算出的紧凑符号地图："
+    "房间 bbox、按 NE/NW/SE/SW 切的四象限覆盖统计、已记录物体的世界坐标、以及一份【代码筛好的候选目标格】。\n"
+    "你的唯一任务：判断哪个象限【欠覆盖】(coverage 低且仍有可达空洞)，从 candidates 里【选一个 id】"
+    "作为机器人下一个要去补扫的目标点。\n"
+    "硬性规则：\n"
+    "1. target_id 必须是 candidates 里真实存在的 id；【绝不自己编造坐标或不存在的 id】。\n"
+    "2. 候选里 reopen_blocked=true 的是被代码判死但疑似『假墙』的格，可以选它让机器人 scan 复核；"
+    "但 last_rejected_reopen 里的格已确认是真墙，不要再选它。\n"
+    "3. 优先补【coverage 最低且 under_covered=true】的象限；被遮挡的凹区(物体少但可能藏东西)也值得去。\n"
+    "4. 四象限都已足够覆盖(无明显 under_covered 象限)时，返回 done:true。\n"
+    "只输出一个合法 JSON(不要代码块标记、不要解释)："
+    "{\"done\":false,\"target_quadrant\":\"NE|NW|SE|SW\",\"target_id\":\"c3\",\"reopen\":false,\"rationale\":\"≤120字\"}"
+)
+
+
+SYSTEM_CONSOLIDATE = (
+    "你是室内机器人的【记忆整理官】。你【看不到图像】。代码已经把探索记录**按位置聚成若干『簇』**，"
+    "每簇含 id、中心坐标(x,y 米)、该位置多视角给出的**名字列表**（常互相矛盾，如同一张桌子被标成 "
+    "桌子/办公桌/柜子）、以及**代表尺寸 size=[宽,高]米**（可能为 null=尺寸不可信）。\n"
+    "你的任务：对**每个簇**判定『这个位置是什么物体』，给【一个】规范中文名：\n"
+    "1. 每个簇就是一个物体的多视角重复——名字列表里互相矛盾正是同物误标。选出/纠正为最准确的【一个】规范中文名。\n"
+    "2. 统一用规范名：办公桌/显示器/办公椅/柜子/沙发/绿植/门 等。\n"
+    "3. 放进 drop 的两种情况：①整簇明显是幻觉/不存在；②**尺寸对判定的类别明显离谱**——用常识判断，"
+    "如 办公桌 宽 <0.3m 或 >2.5m、显示器 宽 >1.2m、沙发 宽 <0.6m、办公椅/绿植 >1.5m 之类明显不合理。"
+    "（size 为 null 时尺寸未知，**不要**因此 drop。）\n"
+    "硬性规则：**每个簇只给一个 name**（同簇名字再矛盾也归并为一个物体，绝不因名字不同拆成多个）；"
+    "只按簇 id 判定，【绝不输出坐标】。\n"
+    "只输出一个合法 JSON(不要代码块、不要解释)："
+    "{\"clusters\":[{\"id\":0,\"name\":\"办公桌\"},{\"id\":1,\"name\":\"显示器\"}],\"drop\":[7]}"
+)
+
+
+def _build_consolidate_prompt(clusters: list) -> str:
+    lines = ["=== 位置簇清单(id | 中心 x,y 米 | 该位置多视角名字 | 代表尺寸[宽,高]米,null=不可信) ===",
+             json.dumps(clusters, ensure_ascii=False),
+             "对每个簇判定该位置是什么物体、给【一个】规范中文名(同簇名字矛盾也归并为一个)；"
+             "整簇幻觉、或尺寸对类别明显离谱的 → 放 drop(size=null 不作删依据)。绝不输出坐标。只输出 JSON。"]
+    return "\n".join(lines)
+
+
+def _build_plan_prompt(payload: dict) -> str:
+    return "\n".join([
+        "=== 房间覆盖现状(数字单位米，已 round 到 0.1) ===",
+        f"bbox: {json.dumps(payload.get('bbox', {}), ensure_ascii=False)}",
+        f"四象限统计: {json.dumps(payload.get('quadrants', {}), ensure_ascii=False)}",
+        f"已记录物体: {json.dumps(payload.get('objects', []), ensure_ascii=False)}",
+        f"候选目标格(只能从这里选 id): {json.dumps(payload.get('candidates', []), ensure_ascii=False)}",
+        f"已确认真墙(别再选): {json.dumps(payload.get('last_rejected_reopen'), ensure_ascii=False)}",
+        f"轮次: {payload.get('round')}  剩余轮次: {payload.get('rounds_left')}",
+        "请选出下一个要去补扫的欠覆盖象限与候选 id（都覆盖够了就 done:true）。只输出 JSON。",
+    ])
+
 
 def _build_guidance_prompt(payload: dict) -> str:
     lines = [

@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
-"""初期房间探索 v1：从零覆盖 + Claude C-format 语义标注。
+"""初期房间探索 v3：从零覆盖 + Qwen 本地语义标注 + Claude 象限调度官（叠加不替换）。
 
-与补足模式(autonomy_probe)的区别：不依赖任何先验语义/锚点，机器人从零在房间里【铺开覆盖】，
-每到一个视角触发【云端记忆作者 Claude】产出 C-format 语义记录。粗边界 = 走过点 + 各扇区扫到的墙点。
+角色分工（本模块严格遵守，见 Report/proposal.md）：
+- Qwen（本地、免费）——逐帧看图标物体+ROI（感知），代码用 depth_roi 回填几何。
+- Claude（云端、结构性低频触发）——【象限调度官/Role-1】：只读符号地图(bbox+四象限覆盖统计+物体坐标
+  + 代码筛好的候选格)，【从候选里选一个 id】指出下一步该补哪个欠覆盖象限；绝不看像素、不产坐标。
+- 代码——几何/去重/导航(geo_goto)/安全/覆盖保证。frontier 兜底无条件跑，守住 ≥65% 召回下限。
 
-角色分工：代码做执行/安全(geo_step_open)，Qwen 选下一个探索视角(标像素)，Claude 写语义记录。
-v1 核心实验问：Qwen 逐帧驱动室内覆盖到底稳不稳（铺开 vs 转圈）——不稳再上代码 frontier/占据栅格。
+三段式主流程：STAGE A recon（起点环视→四角→中心 360° 自举 bbox）→ STAGE B 调度官轮询（Claude 选象限、
+scan 复核假墙、VFH 去补、物体格停 ≥0.5m）→ STAGE C frontier 兜底（覆盖保证）。三段共用 _absorb_sweep
+把观测折进同一状态袋，统一喂不改动的去重+写盘路径。
 
 运行：conda run -n vllm python explore_probe.py（需 ANTHROPIC_AUTH_TOKEN + ANTHROPIC_BASE_URL gateway）。
 """
@@ -25,6 +29,7 @@ for p in (HERE, REPORT_DIR):
 
 from agent_core import config, harness
 from agent_core import navigator as nav
+from agent_core.cloud.providers import AnthropicProvider
 from agent_core.executor import Executor
 from agent_core.geometry import depth_projection as dp
 from agent_core.memory.fs_memory import FsMemory
@@ -35,7 +40,7 @@ START_XY = (-0.5, -1.0)        # 休息室起点（初始条件，非答案）
 START_TOL_M = 1.5
 
 # —— 覆盖收敛参数（代码持有覆盖保证；vantage=云端标注成本上限，nav_steps=平移硬上限，两者解耦）——
-MAX_VANTAGES = 26             # 全景视角上限——整屋 break_room(~9×7m，含东侧办公区)需更多 vantage 才铺满
+MAX_VANTAGES = 18             # 全景视角上限（从26降，缩短单轮：recon~6 + 调度官~6 + 兜底~6 足够铺满单间）
 MAX_NAV_STEPS = 130          # 平移步(geo_step_open)硬上限，与 vantage 解耦的安全兜底（随屋大调高）
 MIN_VANTAGE_SPACING_M = 1.0  # 新 vantage 距上一个 vantage 至少这么远才环视（防 _drive_to 卡住时原地重扫浪费）
 STUCK_LIMIT = 2              # 连续 STUCK_LIMIT 轮净位移<阈值 → 触发脱困/放弃
@@ -149,6 +154,7 @@ PITCH = 1.4              # 格距（米）；覆盖以此为步进向四周铺�
 HINT_CONE_DEG = 30.0    # 顾问提示锥：只在此锥内才算"命中提示方向"
 HINT_BAND_M = 0.75 * PITCH  # 距离量化带：hint 只在同一带内重排，永不跨距离碾压（近优先）
 SWEEP_HEADINGS = (0.0, 90.0, 180.0, 270.0)  # 每个 vantage 原地环视的世界朝向
+NEAR_LABEL_M = 0.5      # 标注铁律：正前 scan 最近障碍必须 > 此值才让 Qwen 标注（太近视角不全→误标→撑爆去重）
 BBOX_CLAMP_M = 6.0      # frontier 播种 bbox 钳制半径（坏墙点不至于把 frontier 炸开）
 BBOX_MAX_CELLS = 120    # 播种格数上限保护
 DOOR_CLUSTER_M = 1.2    # 门世界点聚类阈值（去重）
@@ -158,6 +164,25 @@ DEDUP_M = 0.6           # 几何校验：同类物体 abs_pose 距离 ≤ 此值
 RELIABLE_Z = (-0.2, 1.6)  # 可信高度带（地面家具）；超出=高处/墙挂物，单帧 depth 反投不可信 → 按名归并并标记
 SANE_MAX_M = 2.5        # A2 尺寸清洗：任一维 > 此值=depth 打到远墙的虚大尺寸 → 标 size_unreliable 并置 null
 BOUNDARY_MARGIN = 0.6   # abs_pose 超出房间边界此余量=depth 打到远墙的错误投影 → 视作不可信
+
+# ===== Claude 象限调度官（Role-1 覆盖规划；叠加在代码 frontier 兜底之上，绝不替换）=====
+# 角色分工不变：Claude 只读符号地图【选】去哪(从代码筛好的候选里选 id，不产坐标)，代码保证走得成/不漏。
+RECON_INSET_M = 0.8            # recon：bbox 四角向内缩这么多作为 4 个 recon 目标点
+RECON_MAX_ITERS = 10          # recon/中心 geo_goto 每次 max_iters
+DIRECTOR_MAX_ROUNDS = 8       # Claude plan_coverage 调用轮数硬上限（成本/延迟）
+DIRECTOR_NAV_BUDGET = int(0.6 * MAX_NAV_STEPS)  # 调度官最多吃这么多平移步 → 兜底始终留 ≥40%
+DIRECTOR_MAX_ITERS = 12       # 调度官目标 geo_goto 每次 max_iters
+DIRECTOR_EMPTY_LIMIT = 2      # 连续这么多轮空计划(done 之外的无效/幻觉) → 提前交给兜底
+DIRECTOR_FAIL_LIMIT = 3       # 连续这么多个目标都到不了(即使绕行) → 该向不可达，提前交给兜底(保住 backstop 预算)
+DIRECTOR_MAX_LEGS = 14        # 调度官 geo_goto_around 反应式绕行腿数上限（绕红柜进东侧办公区要够腿）
+QUAD_COVER_TARGET = 0.6       # 象限 coverage < 此值 且 仍有可达空洞 = under_covered
+CAND_PER_QUAD = 3             # 每象限给 Claude 的候选格上限（payload 紧凑）
+REOPEN_FREE_NEIGHBORS = 3     # blocked 格 8 邻里 ≥ 此数是 visited → 疑似假墙，作 reopen 候选
+REOPEN_FRONT_CONE_DEG = 30.0  # 假墙 scan 复核：前向锥半角
+REOPEN_CLEAR_MARGIN = 0.4     # 复核判开：前向最近障碍 ≥ 到目标格距离 + 此余量（匹配 front_block_m）
+OBJECT_STANDOFF_M = 0.5       # 停车铁律：目标格落着物体则只贴近到 ≥ 此距离（太近/太远都看不清）
+CONSOLIDATE_CLUSTER_M = 0.3   # Role-2 整理：位置聚簇阈值。实测0.3最优：只并近乎重合的同物重复(52→38)、
+#                               召回不掉(60%)；再大(0.6)会把密集区里挨着的不同物体(显示器vs桌)误并、掉召回
 
 ADVISOR_SYS = (
     "你是室内机器人的【探索顾问】：不开车、不做导航决策，只看图给方向提示。\n"
@@ -277,11 +302,36 @@ def _blocked_cone(frontier, pose, target_xy, cone_deg=25.0):
     return out
 
 
+def _front_clear(ex):
+    """读正前方 scan 最近障碍距离（米）；读不到返回 None。"""
+    try:
+        s = json.loads(ex.ros.call("scan_summary", {}).text)
+        return s.get("front_min_m")
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _ensure_view_distance(ex, min_clear=NEAR_LABEL_M, max_back=3):
+    """标注铁律：正前 scan 最近障碍必须 > min_clear 才标注（太近视角不全→误标）。
+    太近就后退拉开（有向安全已允许后退脱离死区）。返回最终正前距离(米)或 None。"""
+    front = _front_clear(ex)
+    tries = 0
+    while front is not None and front < min_clear and tries < max_back:
+        r = ex.ros.call("move", {"distance_m": -0.35})   # 后退拉开视距
+        # 后方也被挡(safety 否决后退)→退不动，停止尝试
+        if '"traveled_m":0.0' in (r.text or "") and '"status":"safety_stop"' in (r.text or ""):
+            break
+        front = _front_clear(ex)
+        tries += 1
+    return front
+
+
 def _sweep_vantage(ex, known_names, headings=SWEEP_HEADINGS):
     """到格后【原地环视】：逐朝向 Qwen inspect（出物体+ROI，本地、免费）+ 顾问标门 + 收墙点；
     代码用 depth_roi 给每个物体回填 size+abs_pose（贴物体的框，比 bearing 列距离更准）。
 
     name_hints=known_names（本区域已记物体名）→ 让 Qwen 沿用同名，减少跨帧命名发散（提升类别召回）。
+    标注前强制正前 scan>NEAR_LABEL_M（太近视角不全易误标、撑爆去重）——退不开的朝向只收墙点不标注。
     返回 {objects(本 vantage 全部带几何的 Qwen 物体), hint_bearings(世界度), doors_raw, wall_pts}。
     """
     objs_all, hint_bearings, doors_raw, wall_pts = [], [], [], []
@@ -289,9 +339,13 @@ def _sweep_vantage(ex, known_names, headings=SWEEP_HEADINGS):
     for h in headings:
         p = _pose(ex)
         nav.geo_face_point(ex, p["x"] + math.cos(math.radians(h)), p["y"] + math.sin(math.radians(h)))
+        front = _ensure_view_distance(ex)     # 太近先后退，保证正前 scan>0.5 再标注
         cur = _pose(ex)
-        rep = harness.inspect_and_report(ex, name_hints=(sorted(set(known_names)) or None))
         wall_pts.extend(_scan_world_points(ex, cur))
+        if front is not None and front < NEAR_LABEL_M:
+            print(f"    [跳过标注] 正前仅 {front:.2f}m<{NEAR_LABEL_M}m 且退不开 → 本朝向不标注(防近距误标)")
+            continue
+        rep = harness.inspect_and_report(ex, name_hints=(sorted(set(known_names)) or None))
         for hh in _advisor(ex, rep):
             if not isinstance(hh, dict):
                 continue
@@ -454,6 +508,108 @@ def _dedup_objects(vantage_records, boundary):
     return reliable + unr_final
 
 
+# ===== Role-2：代码按位置聚簇 → Claude 只给每簇规范名 → 代码按簇合并（几何归代码、语义归 Claude）=====
+def _position_clusters(records, cluster_m=CONSOLIDATE_CLUSTER_M):
+    """把去重后记录按世界位置贪心聚簇（name-agnostic，代码持有几何）。
+    返回 [(member_indices, (cx,cy) or None), ...]；无坐标的各自单簇。"""
+    clusters, singles = [], []
+    for i, o in enumerate(records):
+        ap = o.get("abs_pose")
+        if not (isinstance(ap, dict) and ap.get("x") is not None):
+            singles.append(i)
+            continue
+        x, y = float(ap["x"]), float(ap.get("y") or 0.0)
+        hit = next((c for c in clusters
+                    if math.hypot(x - c["sx"] / c["n"], y - c["sy"] / c["n"]) <= cluster_m), None)
+        if hit:
+            hit["ids"].append(i)
+            hit["sx"] += x
+            hit["sy"] += y
+            hit["n"] += 1
+        else:
+            clusters.append({"ids": [i], "sx": x, "sy": y, "n": 1})
+    out = [(c["ids"], (round(c["sx"] / c["n"], 2), round(c["sy"] / c["n"], 2))) for c in clusters]
+    out += [([i], None) for i in singles]
+    return out
+
+
+def _merge_members(members, canonical):
+    """把一簇成员合并成一个物体（几何取更近帧、别名并集），强制规范名。"""
+    base = dict(members[0])
+    for m in members[1:]:
+        _merge_obj_pair(base, m)
+    aliases = list(base.get("aliases") or []) + [m.get("name") for m in members]
+    base["name"] = canonical
+    ded = _dedup_aliases(aliases, canonical)
+    if ded:
+        base["aliases"] = ded
+    else:
+        base.pop("aliases", None)
+    base["verified_by"] = list(dict.fromkeys((base.get("verified_by") or []) + ["claude_consolidate"]))
+    return base
+
+
+def _majority_name(records, ids):
+    """簇内多数（归一化）名对应的原始名——Claude 没判定时的保守兜底。"""
+    from collections import Counter
+    top = Counter(_norm_name(records[i].get("name")) for i in ids).most_common(1)[0][0]
+    return next((records[i].get("name") for i in ids if _norm_name(records[i].get("name")) == top),
+                records[ids[0]].get("name"))
+
+
+def _apply_consolidation(records, clusters, plan):
+    """按 Claude 的【每簇一个规范名】整理：每簇成员合并成一个物体（坐标由代码取更近帧、别名并集）；
+    drop 整簇剔除；Claude 未判定的簇 → 按多数名合并保留（不丢）。plan 无效 → 返回原 records。
+    每簇恒 1 个物体（同簇=同一物理物体的多视角，绝不因名字矛盾拆成多个 → 消除同位重名）。"""
+    if not isinstance(plan, dict) or not (plan.get("clusters") or plan.get("drop")):
+        return records
+    drop = {i for i in (plan.get("drop") or []) if isinstance(i, int)}
+    names = {c["id"]: c["name"] for c in (plan.get("clusters") or [])
+             if isinstance(c, dict) and isinstance(c.get("id"), int) and c.get("name")}
+    out = []
+    for cid, (ids, _cen) in enumerate(clusters):
+        if cid in drop:
+            continue
+        name = names.get(cid) or _majority_name(records, ids)
+        out.append(_merge_members([records[i] for i in ids], name))
+    return out
+
+
+def _cluster_size(records, ids):
+    """簇代表尺寸 [宽,高](米)：取距离最近且尺寸可信的成员；全不可信 → None（尺寸未知，不作删依据）。"""
+    best = None
+    for i in ids:
+        o = records[i]
+        sz = o.get("size") or {}
+        if o.get("size_unreliable") or sz.get("width_m") is None:
+            continue
+        d = o.get("distance_m")
+        key = d if isinstance(d, (int, float)) else 1e9
+        if best is None or key < best[0]:
+            best = (key, sz)
+    if best is None:
+        return None
+    return [round(best[1].get("width_m") or 0.0, 2), round(best[1].get("height_m") or 0.0, 2)]
+
+
+def _consolidate_memory(records, director, cluster_m=CONSOLIDATE_CLUSTER_M):
+    """探索写盘前一次记忆整理：代码按位置聚簇 → Claude 给每簇规范名 + 判尺寸离谱则删 → 代码合并。
+    Claude 失败/空计划 → 原样返回（安全降级）。"""
+    clusters = _position_clusters(records, cluster_m)
+    payload = [{"id": cid,
+                "x": cen[0] if cen else None, "y": cen[1] if cen else None,
+                "names": [records[i].get("name") for i in ids],
+                "size": _cluster_size(records, ids)}     # [宽,高]米 或 null；供 Claude 判尺寸合理性
+               for cid, (ids, cen) in enumerate(clusters)]
+    plan = director.consolidate_memory(payload)
+    out = _apply_consolidation(records, clusters, plan)
+    if out is records:
+        print("[整理] Claude 未返回有效计划 → 跳过整理（原样落库）")
+    else:
+        print(f"[整理] 记忆整理官：{len(records)} 记录 / {len(clusters)} 位置簇 → {len(out)} 物体")
+    return out
+
+
 def _cluster_doors(doors_raw, cluster_m=DOOR_CLUSTER_M, nominal_m=DOOR_NOMINAL_M):
     """门空间去重：把每条门(观察位姿+世界 bearing)沿名义距离投成世界点，贪心聚类合并重复门。
 
@@ -504,6 +660,305 @@ def _validate_doors(doors, bbox):
     return out
 
 
+# ===== Claude 象限调度官：纯函数 helpers（可单测，不碰 ROS/网络）=====
+def _absorb_sweep(sweep, *, wall_points, vantage_records, doors_raw, known_names):
+    """三阶段(recon/director/兜底)【统一】折叠一次环视结果 → 保证 _dedup_objects 对所有来源一视同仁。
+    只折叠环视产物(墙点/物体/门/名字)；visited/steps_log 由各调用点按需另记。返回 hint_bearings。"""
+    wall_points.extend(sweep["wall_pts"])
+    vantage_records.append({"objects": sweep["objects"]})
+    doors_raw.extend(sweep["doors_raw"])
+    known_names.extend(o.get("name") for o in sweep["objects"] if o.get("name"))
+    return sweep["hint_bearings"]
+
+
+def _recon_corners(bbox, inset=RECON_INSET_M):
+    """bbox 四角向内缩 inset → 4 个 recon 目标点（自举房间范围）。bbox 退化/太小 → []。"""
+    if not bbox:
+        return []
+    x0, x1, y0, y1 = bbox["xmin"], bbox["xmax"], bbox["ymin"], bbox["ymax"]
+    if (x1 - x0) < 2 * inset or (y1 - y0) < 2 * inset:
+        return []
+    return [(x0 + inset, y0 + inset), (x1 - inset, y0 + inset),
+            (x1 - inset, y1 - inset), (x0 + inset, y1 - inset)]
+
+
+def _order_nearest(points, pose):
+    """贪心就近串起点序（减少 recon 里程）。"""
+    remaining = list(points)
+    cx, cy = pose.get("x", 0.0), pose.get("y", 0.0)
+    ordered = []
+    while remaining:
+        nxt = min(remaining, key=lambda p: math.hypot(p[0] - cx, p[1] - cy))
+        ordered.append(nxt)
+        remaining.remove(nxt)
+        cx, cy = nxt
+    return ordered
+
+
+def _ang180(a):
+    return ((a + 180.0) % 360.0) - 180.0
+
+
+def _quad_of(x, y, xmid, ymid):
+    """按 bbox 中点判象限：NE/NW/SE/SW。"""
+    return ("N" if y >= ymid else "S") + ("E" if x >= xmid else "W")
+
+
+def _quad_centroid(q, bbox, xmid, ymid):
+    """象限几何中心点（候选格按到此点距离排序，优先补象限深处）。"""
+    x = (xmid + bbox["xmax"]) / 2.0 if q[1] == "E" else (bbox["xmin"] + xmid) / 2.0
+    y = (ymid + bbox["ymax"]) / 2.0 if q[0] == "N" else (bbox["ymin"] + ymid) / 2.0
+    return (x, y)
+
+
+def _bbox_cells(bbox, pitch=PITCH):
+    """bbox 内所有格（与 _seed_frontier_from_bbox 同一 clamp/上限）；不过滤 visited/blocked。"""
+    if not bbox:
+        return set()
+    xmin = max(bbox["xmin"], -BBOX_CLAMP_M)
+    xmax = min(bbox["xmax"], BBOX_CLAMP_M)
+    ymin = max(bbox["ymin"], -BBOX_CLAMP_M)
+    ymax = min(bbox["ymax"], BBOX_CLAMP_M)
+    if (max(0.0, xmax - xmin) * max(0.0, ymax - ymin)) / (pitch * pitch) > BBOX_MAX_CELLS:
+        return set()
+    cells = set()
+    for cx in range(int(math.floor(xmin / pitch)), int(math.ceil(xmax / pitch)) + 1):
+        for cy in range(int(math.floor(ymin / pitch)), int(math.ceil(ymax / pitch)) + 1):
+            cells.add((cx, cy))
+    return cells
+
+
+def _objects_xy(vantage_records, bbox):
+    """去重后【有可信 abs_pose】的物体 (name,x,y) 列表 —— 喂 Claude payload / 象限物体计数。"""
+    out = []
+    for o in _dedup_objects(vantage_records, bbox):
+        ap = o.get("abs_pose")
+        if isinstance(ap, dict) and ap.get("x") is not None:
+            out.append((o.get("name"), round(float(ap["x"]), 1), round(float(ap.get("y") or 0.0), 1)))
+    return out
+
+
+def _quadrant_stats(bbox, visited_cells, blocked_cells, obj_xy):
+    """每象限覆盖统计：observed=visited∪blocked，coverage=observed/total。
+    under_covered = coverage<QUAD_COVER_TARGET 且【仍有非 blocked 未访问的可达空洞】
+    （全 blocked/全访问的象限不算欠覆盖，防调度官死盯不可达区）。"""
+    quads = ("NE", "NW", "SE", "SW")
+    base = {q: {"visited": 0, "blocked": 0, "total": 0, "n_objects": 0, "_open": False} for q in quads}
+    if not bbox:
+        return {q: {"visited": 0, "blocked": 0, "total": 0, "n_objects": 0,
+                    "observed": 0, "coverage": 0.0, "under_covered": False} for q in quads}
+    xmid = (bbox["xmin"] + bbox["xmax"]) / 2.0
+    ymid = (bbox["ymin"] + bbox["ymax"]) / 2.0
+    for c in _bbox_cells(bbox):
+        cx, cy = _cell_center(c)
+        q = _quad_of(cx, cy, xmid, ymid)
+        base[q]["total"] += 1
+        if c in visited_cells:
+            base[q]["visited"] += 1
+        elif c in blocked_cells:
+            base[q]["blocked"] += 1
+        else:
+            base[q]["_open"] = True
+    for (_n, ox, oy) in obj_xy:
+        base[_quad_of(ox, oy, xmid, ymid)]["n_objects"] += 1
+    out = {}
+    for q in quads:
+        v = base[q]
+        observed = v["visited"] + v["blocked"]
+        cov = observed / v["total"] if v["total"] else 1.0
+        out[q] = {"visited": v["visited"], "blocked": v["blocked"], "total": v["total"],
+                  "n_objects": v["n_objects"], "observed": observed, "coverage": round(cov, 2),
+                  "under_covered": bool(cov < QUAD_COVER_TARGET and v["_open"])}
+    return out
+
+
+def _candidate_cells(bbox, visited_cells, blocked_cells, per_quad=CAND_PER_QUAD):
+    """给 Claude 的【代码筛好的候选格】(反幻觉边界：它只能选 id、不产坐标)：
+    ①每象限最靠质心的未覆盖格 top-N；②reopen 候选=被自由空间包围(≥REOPEN_FREE_NEIGHBORS 个 visited 邻居)的 blocked 格。
+    返回 [{id, quad, x, y, cell, reopen_blocked}]。"""
+    if not bbox:
+        return []
+    xmid = (bbox["xmin"] + bbox["xmax"]) / 2.0
+    ymid = (bbox["ymin"] + bbox["ymax"]) / 2.0
+    by_quad = {q: [] for q in ("NE", "NW", "SE", "SW")}
+    for c in _bbox_cells(bbox):
+        cx, cy = _cell_center(c)
+        by_quad[_quad_of(cx, cy, xmid, ymid)].append(c)
+    cands = []
+    for q, qcells in by_quad.items():
+        cen = _quad_centroid(q, bbox, xmid, ymid)
+        openc = [c for c in qcells if c not in visited_cells and c not in blocked_cells]
+        openc.sort(key=lambda c: math.hypot(_cell_center(c)[0] - cen[0], _cell_center(c)[1] - cen[1]))
+        for c in openc[:per_quad]:
+            cx, cy = _cell_center(c)
+            cands.append({"quad": q, "x": round(cx, 1), "y": round(cy, 1),
+                          "cell": c, "reopen_blocked": False})
+    for c in sorted(blocked_cells):
+        if sum(1 for n in _neighbors(c) if n in visited_cells) >= REOPEN_FREE_NEIGHBORS:
+            cx, cy = _cell_center(c)
+            cands.append({"quad": _quad_of(cx, cy, xmid, ymid), "x": round(cx, 1),
+                          "y": round(cy, 1), "cell": c, "reopen_blocked": True})
+    for i, cc in enumerate(cands):
+        cc["id"] = f"c{i}"
+    return cands
+
+
+def _build_plan_payload(bbox, quad_stats, obj_xy, candidates, last_rejected, round_i, rounds_left):
+    """把符号地图压成 Claude payload（候选剥掉内部 cell 字段，只留 id/quad/x/y/reopen_blocked）。"""
+    b = {k: round(v, 1) for k, v in bbox.items()} if bbox else {}
+    objs = [{"name": n, "x": x, "y": y} for (n, x, y) in obj_xy]
+    cands = [{"id": c["id"], "quad": c["quad"], "x": c["x"], "y": c["y"],
+              "reopen_blocked": c["reopen_blocked"]} for c in candidates]
+    return {"bbox": b, "quadrants": quad_stats, "objects": objs, "candidates": cands,
+            "last_rejected_reopen": last_rejected, "round": round_i, "rounds_left": rounds_left}
+
+
+def _validate_plan_choice(plan, candidates):
+    """把 Claude 的 target_id 映回候选；缺失/幻觉/格式错 → None（安全跳过本轮，不致命）。"""
+    if not isinstance(plan, dict):
+        return None
+    tid = plan.get("target_id")
+    if not tid:
+        return None
+    for c in candidates:
+        if c["id"] == tid:
+            return c
+    return None
+
+
+def _stop_rule(target_cell, obj_xy, standoff=OBJECT_STANDOFF_M):
+    """停车铁律：目标格落着已记录物体 → 抬 front_block_m/tol 只贴近到 ≥standoff（太近看不清）。
+    否则默认。返回 (front_block_m, tol_m)。"""
+    cx, cy = _cell_center(target_cell)
+    near = any(math.hypot(ox - cx, oy - cy) <= PITCH / 2.0 for (_n, ox, oy) in obj_xy)
+    if near:
+        return (standoff, standoff + 0.2)
+    return (0.4, 0.5)
+
+
+def _is_forward_open(sectors, dist_to_cell, cone_deg=REOPEN_FRONT_CONE_DEG, margin=REOPEN_CLEAR_MARGIN):
+    """假墙 scan 复核谓词（纯函数）：前向锥(|角|≤cone)内最近障碍 ≥ 到目标格距离+margin → 判『开』。
+    sectors: {角度(度,机体系,0=前): 最近障碍米}。无有效前向读数 → False（保守当墙，绝不误开进实墙）。"""
+    fronts = [d for a, d in (sectors or {}).items()
+              if isinstance(d, (int, float)) and d > 0 and abs(_ang180(a)) <= cone_deg]
+    if not fronts:
+        return False
+    return min(fronts) >= dist_to_cell + margin
+
+
+def _min_vantage_spacing_ok(cur, last_vantage_xy):
+    """新 vantage 距上一个 ≥ MIN_VANTAGE_SPACING_M 才值得重扫（防原地重复浪费）。"""
+    if last_vantage_xy is None:
+        return True
+    return math.hypot(cur["x"] - last_vantage_xy[0], cur["y"] - last_vantage_xy[1]) >= MIN_VANTAGE_SPACING_M
+
+
+# ===== Claude 象限调度官：需 ROS 的 helper（scan 复核）=====
+def _reverify_open(ex, cell):
+    """假墙重开前的 scan 复核（护栏）：面向目标格 → 读 scan 扇区 → 前向锥是否真有缺口。
+    真墙 → False（调用方回填 blocked 并反馈 Claude）；假墙 → True（可 discard 后驱动）。"""
+    cx, cy = _cell_center(cell)
+    p = _pose(ex)
+    dist_to_cell = math.hypot(cx - p["x"], cy - p["y"])
+    try:
+        nav.geo_face_point(ex, cx, cy)
+        sectors = nav._scan_sectors(ex, sectors=12)
+    except Exception:  # noqa: BLE001
+        return False
+    return _is_forward_open(sectors, dist_to_cell)
+
+
+def _frontier_backstop(ex, *, visited, wall_points, vantage_records, doors_raw, steps_log,
+                       visited_cells, blocked_cells, known_names,
+                       nav_steps, vantages, last_vantage_xy, last_pose):
+    """代码网格 frontier 覆盖回路 —— 覆盖保证【兜底】(recon+director 之后无条件跑，守住 ≥65%)。
+    从当前 bbox 重新播种 frontier(自动排除已 visited/blocked)，跑到覆盖完/上限/卡死。
+    返回 (nav_steps, vantages, stop_reason, last_pose)。逻辑同旧主回路，仅参数化 + 共用 _absorb_sweep。"""
+    stop_reason = "nav_cap"
+    stuck = 0
+    frontier = set()
+    cur = last_pose
+    last_iter_xy = (last_pose["x"], last_pose["y"])
+    while True:
+        if wall_points:
+            frontier |= _seed_frontier_from_bbox(
+                dp.boundary_from_points(wall_points + visited), visited_cells, blocked_cells)
+        frontier -= visited_cells
+        frontier -= blocked_cells
+        if not frontier:
+            stop_reason = "covered"
+            print("[覆盖] 所有可达格已覆盖 → 完成")
+            break
+        if vantages >= MAX_VANTAGES:
+            stop_reason = "vantage_cap"
+            break
+        if nav_steps >= MAX_NAV_STEPS:
+            stop_reason = "nav_cap"
+            break
+
+        pose = _pose(ex)
+        last_pose = pose
+        visited.append([round(pose["x"], 2), round(pose["y"], 2)])
+        visited_cells.add(_cell(pose["x"], pose["y"]))
+
+        if not _min_vantage_spacing_ok(pose, last_vantage_xy):
+            hint_bearings = []
+            print(f"  [跳过环视] 距上一 vantage <{MIN_VANTAGE_SPACING_M}m，不重扫")
+        else:
+            sweep = _sweep_vantage(ex, known_names)
+            hint_bearings = _absorb_sweep(sweep, wall_points=wall_points, vantage_records=vantage_records,
+                                          doors_raw=doors_raw, known_names=known_names)
+            vantages += 1
+            last_vantage_xy = (pose["x"], pose["y"])
+            cobjs = [o.get("name") for o in sweep["objects"]]
+            print(f"[视角{vantages}] pose=({pose['x']:.2f},{pose['y']:.2f}) 环视 Qwen记{len(cobjs)}物体 "
+                  f"门提示={len(sweep['doors_raw'])}")
+            steps_log.append({"step": vantages - 1, "pose": pose, "qwen_objects": cobjs,
+                              "n_doors": len(sweep["doors_raw"])})
+
+        frontier |= _seed_frontier_from_bbox(
+            dp.boundary_from_points(wall_points + visited), visited_cells, blocked_cells)
+        frontier -= visited_cells
+        frontier -= blocked_cells
+        if not frontier:
+            stop_reason = "covered"
+            break
+        target_cell = _pick_target(frontier, pose, hint_bearings)
+        tx, ty = _cell_center(target_cell)
+        reached, cur, ns = _drive_to(ex, (tx, ty))
+        nav_steps += ns
+        if reached:
+            visited_cells.add(target_cell)
+            visited_cells.add(_cell(cur["x"], cur["y"]))
+            frontier |= set(_neighbors(target_cell))
+            print(f"  → 格{target_cell}({tx:.1f},{ty:.1f}) 到位 ({cur['x']:.2f},{cur['y']:.2f}) nav={nav_steps}")
+        else:
+            blocked_cells.add(target_cell)
+            blocked_cells |= _blocked_cone(frontier, pose, (tx, ty))
+            print(f"  → 格{target_cell}({tx:.1f},{ty:.1f}) 撞墙 → 标 blocked(含共线锥) nav={nav_steps}")
+
+        moved = math.hypot(cur["x"] - last_iter_xy[0], cur["y"] - last_iter_xy[1])
+        last_iter_xy = (cur["x"], cur["y"])
+        stuck = stuck + 1 if moved < 0.15 else 0
+        if stuck >= STUCK_LIMIT:
+            frontier -= visited_cells
+            frontier -= blocked_cells
+            if frontier:
+                far = max(frontier, key=lambda c: math.hypot(
+                    _cell_center(c)[0] - cur["x"], _cell_center(c)[1] - cur["y"]))
+                fx, fy = _cell_center(far)
+                _, cur, ns2 = _drive_to(ex, (fx, fy), max_steps=3)
+                nav_steps += ns2
+                esc = math.hypot(cur["x"] - last_iter_xy[0], cur["y"] - last_iter_xy[1])
+                last_iter_xy = (cur["x"], cur["y"])
+                print(f"  [脱困] 逃向最远格({fx:.1f},{fy:.1f}) 位移{esc:.2f}m nav={nav_steps}")
+                if esc < 0.15:
+                    stop_reason = "stuck"
+                    break
+            stuck = 0
+    return nav_steps, vantages, stop_reason, last_pose
+
+
 def main():
     _hr("explore_probe v2：从零覆盖 + Qwen 本地语义标注（代码做几何/去重/整理）")
     ex = Executor()
@@ -522,14 +977,11 @@ def main():
     d_start = math.hypot(sp.get("x", 99) - START_XY[0], sp.get("y", 99) - START_XY[1])
     print(f"[起始位姿] {sp}  距起点 {d_start:.2f}m")
     if d_start > START_TOL_M:
-        # 经北侧开阔区(1.5,1.5)中转再回起点——直接朝起点常被 wall(1) 挡住绕不过来
-        print(f"[软复位] VFH 经 (1.5,1.5) 中转开回 {START_XY}…")
+        # 经北侧开阔区(1.5,1.5)中转再回起点——直接朝起点常被 wall(1) 挡住绕不过来。
+        # 用 geo_goto_around（反应式绕行，会先退一点解钉）而非直冲，能从贴墙/近隔断的搁浅位自救。
+        print(f"[软复位] 绕行经 (1.5,1.5) 中转开回 {START_XY}…")
         for wp in ((1.5, 1.5), START_XY):
-            for _ in range(28):
-                cp = _pose(ex)
-                if math.hypot(cp["x"] - wp[0], cp["y"] - wp[1]) <= 0.5:
-                    break
-                nav.geo_step_open(ex, nav.bearing_deg(cp["x"], cp["y"], wp[0], wp[1]))
+            nav.geo_goto_around(ex, wp[0], wp[1], tol_m=0.5, max_legs=20)
         cp = _pose(ex)
         if math.hypot(cp["x"] - START_XY[0], cp["y"] - START_XY[1]) > START_TOL_M:
             print(f"⚠️ 软复位未回到起点(仍在 {cp.get('x'):.1f},{cp.get('y'):.1f})；"
@@ -540,106 +992,135 @@ def main():
     rec_type = "lounge"
     stop_reason = "nav_cap"
 
-    # 代码网格 frontier：从起点格向四周铺开；撞墙的格标 blocked，全部覆盖完才停
+    # 共享状态袋：recon / director / 兜底 三阶段同一份 → 统一喂不改动的去重+写盘路径
     start = _pose(ex)
     last_pose = start
     visited_cells, blocked_cells = {_cell(start["x"], start["y"])}, set()
-    frontier = set(_neighbors(_cell(start["x"], start["y"])))
-    vantages, nav_steps, stuck = 0, 0, 0
-    last_iter_xy = (start["x"], start["y"])
-    last_vantage_xy = None   # 上一个实际环视点（A6 间距门槛用）
-    known_names = []   # 已记录物体名（作命名锚点喂 Qwen，减少跨帧命名发散）
+    nav_steps, vantages = 0, 0
+    last_vantage_xy = None          # 上一个实际环视点（间距门槛用）
+    known_names = []                # 已记录物体名（作命名锚点喂 Qwen，减少跨帧命名发散）
+    last_rejected_reopen = []       # scan 复核确认过的真墙 [x,y]（反馈 Claude，别再选）
+    director = AnthropicProvider()  # 象限调度官 + 记忆整理官（同一实例）
 
-    _hr("覆盖回路（bbox 播种 frontier → 近优先选格 → VFH 执行 → 每格环视 Qwen 标注）")
+    def _recon_goto_sweep(txp, typ, tag):
+        """recon：VFH 开到点 → 记 visited → 满足间距则环视吸收。更新共享计数。"""
+        nonlocal nav_steps, vantages, last_vantage_xy, last_pose
+        r = nav.geo_goto_around(ex, txp, typ, tol_m=0.5, max_legs=RECON_MAX_ITERS,
+                                max_step_m=1.0, front_block_m=0.4)
+        nav_steps += len(r.get("steps") or [])
+        cur = r.get("pose") or _pose(ex)
+        last_pose = cur
+        visited.append([round(cur["x"], 2), round(cur["y"], 2)])
+        visited_cells.add(_cell(cur["x"], cur["y"]))
+        if _min_vantage_spacing_ok(cur, last_vantage_xy) and vantages < MAX_VANTAGES:
+            sw = _sweep_vantage(ex, known_names)
+            _absorb_sweep(sw, wall_points=wall_points, vantage_records=vantage_records,
+                          doors_raw=doors_raw, known_names=known_names)
+            vantages += 1
+            last_vantage_xy = (cur["x"], cur["y"])
+            print(f"[RECON-{tag}{vantages}] pose=({cur['x']:.2f},{cur['y']:.2f}) Qwen记{len(sw['objects'])}物体")
+
     try:
-        while True:
-            # —— 终止判定：bbox 播种 frontier → 覆盖完 / vantage 上限 / 平移上限 ——
-            if wall_points:
-                frontier |= _seed_frontier_from_bbox(
-                    dp.boundary_from_points(wall_points + visited), visited_cells, blocked_cells)
-            frontier -= visited_cells
-            frontier -= blocked_cells
-            if not frontier:
-                stop_reason = "covered"
-                print("[覆盖] 所有可达格已覆盖 → 完成")
-                break
-            if vantages >= MAX_VANTAGES:
-                stop_reason = "vantage_cap"
-                break
-            if nav_steps >= MAX_NAV_STEPS:
-                stop_reason = "nav_cap"
-                break
+        # ===== STAGE A · RECON：自举 bbox（起点环视 → 四内缩角 → 中心 360°）=====
+        _hr("STAGE A · RECON（起点环视 → 四角 → 中心 360°，自举房间范围）")
+        s0 = _sweep_vantage(ex, known_names)
+        _absorb_sweep(s0, wall_points=wall_points, vantage_records=vantage_records,
+                      doors_raw=doors_raw, known_names=known_names)
+        visited.append([round(start["x"], 2), round(start["y"], 2)])
+        vantages += 1
+        last_vantage_xy = (start["x"], start["y"])
+        steps_log.append({"step": 0, "phase": "recon_start", "pose": start,
+                          "qwen_objects": [o.get("name") for o in s0["objects"]]})
 
-            pose = _pose(ex)
-            last_pose = pose
-            visited.append([round(pose["x"], 2), round(pose["y"], 2)])
-            visited_cells.add(_cell(pose["x"], pose["y"]))
+        prov_bbox = dp.boundary_from_points(wall_points + visited)
+        corners = _order_nearest(_recon_corners(prov_bbox), start)
+        print(f"[RECON] 临时 bbox={prov_bbox}  内缩角点={[(round(x, 1), round(y, 1)) for x, y in corners]}")
+        for (cxp, cyp) in corners:
+            if nav_steps >= DIRECTOR_NAV_BUDGET or vantages >= MAX_VANTAGES:
+                break
+            _recon_goto_sweep(cxp, cyp, "角")
+        # 中心 360°（用四角精炼后的 bbox）
+        rb = dp.boundary_from_points(wall_points + visited)
+        if rb and nav_steps < DIRECTOR_NAV_BUDGET and vantages < MAX_VANTAGES:
+            _recon_goto_sweep((rb["xmin"] + rb["xmax"]) / 2.0, (rb["ymin"] + rb["ymax"]) / 2.0, "中心")
 
-            # —— vantage 间距门槛(A6)：离上一个 vantage 太近(如 _drive_to 卡住原地)就不重扫，直接选下一格 ——
-            too_close = (last_vantage_xy is not None and
-                         math.hypot(pose["x"] - last_vantage_xy[0], pose["y"] - last_vantage_xy[1])
-                         < MIN_VANTAGE_SPACING_M)
-            if too_close:
-                hint_bearings = []
-                print(f"  [跳过环视] 距上一 vantage <{MIN_VANTAGE_SPACING_M}m，不重扫")
+        # ===== STAGE B · CLAUDE 象限调度官（选欠覆盖象限 → 派 Qwen 去补）=====
+        _hr("STAGE B · 象限调度官（Claude 只从代码候选里选 id；scan 复核 + 绕行 VFH 执行）")
+        empty_rounds = 0
+        fail_streak = 0
+        for round_i in range(DIRECTOR_MAX_ROUNDS):
+            if nav_steps >= DIRECTOR_NAV_BUDGET or vantages >= MAX_VANTAGES:
+                print("[调度官] 预算用尽 → 交给 frontier 兜底")
+                break
+            bbox = dp.boundary_from_points(wall_points + visited)
+            obj_xy = _objects_xy(vantage_records, bbox)
+            quad_stats = _quadrant_stats(bbox, visited_cells, blocked_cells, obj_xy)
+            candidates = _candidate_cells(bbox, visited_cells, blocked_cells)
+            if not candidates:
+                print("[调度官] 无候选格（已铺满）→ 交给兜底")
+                break
+            payload = _build_plan_payload(bbox, quad_stats, obj_xy, candidates,
+                                          last_rejected_reopen, round_i, DIRECTOR_MAX_ROUNDS - round_i)
+            plan = director.plan_coverage(payload)
+            if plan.get("done") is True:
+                print(f"[调度官] 判定四象限已足够覆盖(done) rationale={plan.get('rationale', '')}")
+                break
+            tgt = _validate_plan_choice(plan, candidates)
+            if tgt is None:
+                empty_rounds += 1
+                print(f"[调度官] 空/幻觉计划(第{empty_rounds}次) plan={plan}")
+                if empty_rounds >= DIRECTOR_EMPTY_LIMIT:
+                    print("[调度官] 连续空计划 → 提前交给兜底")
+                    break
+                continue
+            empty_rounds = 0
+            cell = tgt["cell"]
+            print(f"[调度官R{round_i}] 选 {tgt['id']}@{tgt['quad']}({tgt['x']},{tgt['y']}) "
+                  f"reopen={tgt['reopen_blocked']} rationale={plan.get('rationale', '')}")
+            # 假墙重开护栏：scan 复核确认真缺口才去；真墙→驳回并反馈
+            if tgt["reopen_blocked"]:
+                if not _reverify_open(ex, cell):
+                    blocked_cells.add(cell)
+                    last_rejected_reopen.append([tgt["x"], tgt["y"]])
+                    print("  [假墙复核] scan 判定真墙 → 驳回，回填 blocked 并反馈 Claude")
+                    continue
+                blocked_cells.discard(cell)
+                print("  [假墙复核] scan 判定有缺口 → 准许重开")
+            tx, ty = _cell_center(cell)
+            fblock, tol = _stop_rule(cell, obj_xy)   # 目标格有物体则停 ≥0.5m
+            # geo_goto_around：撞墙不放弃，反应式绕行（绕红柜经北缺口进东侧办公区），比 geo_goto 直冲强
+            r = nav.geo_goto_around(ex, tx, ty, tol_m=tol, max_legs=DIRECTOR_MAX_LEGS,
+                                    max_step_m=1.0, front_block_m=fblock)
+            nav_steps += len(r.get("steps") or [])
+            cur = r.get("pose") or _pose(ex)
+            last_pose = cur
+            visited.append([round(cur["x"], 2), round(cur["y"], 2)])
+            visited_cells.add(_cell(cur["x"], cur["y"]))
+            if r.get("arrived"):
+                visited_cells.add(cell)
+                fail_streak = 0
             else:
-                # —— 全景环视：逐朝向 Qwen inspect(物体+ROI)+顾问标门+收墙点；代码 depth_roi 回填几何 ——
-                sweep = _sweep_vantage(ex, known_names)
-                wall_points.extend(sweep["wall_pts"])
-                vantage_records.append({"objects": sweep["objects"]})
-                doors_raw.extend(sweep["doors_raw"])
-                hint_bearings = sweep["hint_bearings"]
-                known_names.extend(o.get("name") for o in sweep["objects"] if o.get("name"))
-                cobjs = [o.get("name") for o in sweep["objects"]]
+                blocked_cells.add(cell)   # 绕行仍到不了 → 标 blocked（兜底不再枉试）
+                fail_streak += 1
+                print(f"  → 未到位({r.get('status')}) → 标 blocked（连续失败{fail_streak}）")
+                if fail_streak >= DIRECTOR_FAIL_LIMIT:
+                    print("[调度官] 连续多目标绕行仍不可达 → 提前交给兜底（保住 backstop 预算）")
+                    break
+            if r.get("arrived") and _min_vantage_spacing_ok(cur, last_vantage_xy) and vantages < MAX_VANTAGES:
+                sw = _sweep_vantage(ex, known_names)
+                _absorb_sweep(sw, wall_points=wall_points, vantage_records=vantage_records,
+                              doors_raw=doors_raw, known_names=known_names)
                 vantages += 1
-                last_vantage_xy = (pose["x"], pose["y"])
-                print(f"[视角{vantages}] pose=({pose['x']:.2f},{pose['y']:.2f}) 环视 Qwen记{len(cobjs)}物体 "
-                      f"门提示={len(sweep['doors_raw'])}")
-                steps_log.append({"step": vantages - 1, "pose": pose, "qwen_objects": cobjs,
-                                  "n_doors": len(sweep["doors_raw"])})
+                last_vantage_xy = (cur["x"], cur["y"])
+                print(f"  → 到位环视{vantages} pose=({cur['x']:.2f},{cur['y']:.2f}) Qwen记{len(sw['objects'])}物体 nav={nav_steps}")
 
-            # —— 代码选下一个未覆盖格（近优先，顾问方向仅同距带 tiebreak）——
-            frontier |= _seed_frontier_from_bbox(
-                dp.boundary_from_points(wall_points + visited), visited_cells, blocked_cells)
-            frontier -= visited_cells
-            frontier -= blocked_cells
-            if not frontier:
-                stop_reason = "covered"
-                break
-            target_cell = _pick_target(frontier, pose, hint_bearings)
-            tx, ty = _cell_center(target_cell)
-            reached, cur, ns = _drive_to(ex, (tx, ty))
-            nav_steps += ns
-            if reached:
-                visited_cells.add(target_cell)
-                visited_cells.add(_cell(cur["x"], cur["y"]))
-                frontier |= set(_neighbors(target_cell))
-                print(f"  → 格{target_cell}({tx:.1f},{ty:.1f}) 到位 ({cur['x']:.2f},{cur['y']:.2f}) nav={nav_steps}")
-            else:
-                blocked_cells.add(target_cell)
-                blocked_cells |= _blocked_cone(frontier, pose, (tx, ty))
-                print(f"  → 格{target_cell}({tx:.1f},{ty:.1f}) 撞墙 → 标 blocked(含共线锥) nav={nav_steps}")
-
-            # —— 卡死检测（只测平移轮净位移；环视转向不计）+ 逃逸到最远开阔格 ——
-            moved = math.hypot(cur["x"] - last_iter_xy[0], cur["y"] - last_iter_xy[1])
-            last_iter_xy = (cur["x"], cur["y"])
-            stuck = stuck + 1 if moved < 0.15 else 0
-            if stuck >= STUCK_LIMIT:
-                frontier -= visited_cells
-                frontier -= blocked_cells
-                if frontier:
-                    far = max(frontier, key=lambda c: math.hypot(
-                        _cell_center(c)[0] - cur["x"], _cell_center(c)[1] - cur["y"]))
-                    fx, fy = _cell_center(far)
-                    _, cur, ns2 = _drive_to(ex, (fx, fy), max_steps=3)
-                    nav_steps += ns2
-                    esc = math.hypot(cur["x"] - last_iter_xy[0], cur["y"] - last_iter_xy[1])
-                    last_iter_xy = (cur["x"], cur["y"])
-                    print(f"  [脱困] 逃向最远格({fx:.1f},{fy:.1f}) 位移{esc:.2f}m nav={nav_steps}")
-                    if esc < 0.15:
-                        stop_reason = "stuck"
-                        break
-                stuck = 0
+        # ===== STAGE C · FRONTIER 兜底（覆盖保证；无条件跑，守住 ≥65%）=====
+        _hr("STAGE C · frontier 兜底（无条件补全覆盖，用 nav 剩余额度）")
+        nav_steps, vantages, stop_reason, last_pose = _frontier_backstop(
+            ex, visited=visited, wall_points=wall_points, vantage_records=vantage_records,
+            doors_raw=doors_raw, steps_log=steps_log, visited_cells=visited_cells,
+            blocked_cells=blocked_cells, known_names=known_names,
+            nav_steps=nav_steps, vantages=vantages, last_vantage_xy=last_vantage_xy, last_pose=last_pose)
         ex.ros.call("stop", {})
     finally:
         ex.close()
@@ -650,6 +1131,8 @@ def main():
     raw_count = sum(len(r.get("objects", []) or []) for r in vantage_records)
     clean_objs = _dedup_objects(vantage_records, bbox)
     print(f"[去重] 原始观测 {raw_count} → 几何校验后 {len(clean_objs)} 物体")
+    # —— Role-2：Claude 记忆整理官（同物不同名并组、不同类分开、幻觉剔除；坐标仍由代码聚合）——
+    clean_objs = _consolidate_memory(clean_objs, director)
     # —— 落盘（单一并集写路径）：逐物体 upsert_object（数组并集、同名远位=多实例）——
     n_obj = 0
     for o in clean_objs:

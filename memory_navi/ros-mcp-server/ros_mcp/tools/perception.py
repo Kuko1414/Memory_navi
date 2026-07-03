@@ -308,23 +308,34 @@ def register_perception_tools(mcp: FastMCP, ws_manager: WebSocketManager) -> Non
             vals = patch[(patch > 0.05) & (patch < 9.5)]
             if vals.size == 0:
                 return None
+            # 中心像素深度：ROI 中心一小块(5x5)的中位 = 物体表面。位置/尺寸都以它为准，
+            # 避免用【整框中位】被远墙拉偏（松/偏的框里 median 常落到背景墙 → 坐标打墙、尺寸虚大）。
+            cu, cv = (u0 + u1) // 2, (v0 + v1) // 2
+            cpatch = depth[max(0, cv - 2):cv + 3, max(0, cu - 2):cu + 3].ravel()
+            cvals = cpatch[(cpatch > 0.05) & (cpatch < 9.5)]
+            center_d = float(np.median(cvals)) if cvals.size else None
             vals = np.sort(vals)
-            median = float(np.median(vals))
-            # 1) 按 gap 切簇，取包含 median 的那簇 → 剔掉与前景明显分离的远背景斑块
+            # 1) 按 gap 切簇（升序）；取【含中心像素深度】的那簇 = 物体，远墙(更大、被 gap 隔开)自动排除。
+            #    中心无效则兜底取【最近的有实体支撑簇】(前景物体在墙前) —— 即用户方案：滤掉明显偏大的远值。
             if vals.size == 1:
                 band = vals
             else:
                 splits = np.where(np.diff(vals) > gap_thresh_m)[0]
                 clusters = np.split(vals, splits + 1)
-                band = next((c for c in clusters if c[0] <= median <= c[-1]),
-                            max(clusters, key=len))
-            # 2) 簇内再用稳健分位数 p15/p85 修剪连续地面/墙的深度斜坡尾巴（否则厚度=整跨度虚大）
+                band = None
+                if center_d is not None:
+                    band = next((c for c in clusters if c[0] - 1e-6 <= center_d <= c[-1] + 1e-6), None)
+                if band is None:
+                    support = max(3, int(0.10 * vals.size))
+                    band = next((c for c in clusters if c.size >= support), clusters[0])
+            # 2) 簇内稳健分位数 p15/p85 修剪深度斜坡尾巴（厚度=near_max-near_min，不用整跨度）
             near_min = float(np.percentile(band, 15))
             near_max = float(np.percentile(band, 85))
-            # median 也改用簇内中位（更贴物体表面，少受远背景拉偏）
-            median = float(np.median(band))
+            # 表面深度(供反投求坐标 + 算宽高)：优先中心像素(最贴物体)，否则物体簇中位
+            in_band = center_d is not None and band[0] - 1e-6 <= center_d <= band[-1] + 1e-6
+            surface = center_d if in_band else float(np.median(band))
             return {
-                "median_m": round(median, 3),
+                "median_m": round(surface, 3),
                 "min_m": round(float(vals[0]), 3),
                 "max_m": round(float(vals[-1]), 3),
                 "near_min_m": round(near_min, 3),

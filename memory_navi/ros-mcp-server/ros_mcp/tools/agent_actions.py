@@ -29,8 +29,8 @@ from ros_mcp.utils.websocket import WebSocketManager, parse_input
 DEFAULT_NAMESPACE = os.environ.get("ROS_NAMESPACE", "agent0")
 
 #: 默认运动参数。
-DEFAULT_LIN_SPEED = 0.6      # m/s（提速：闭环读真值位姿故距离仍准，只缩短时间；mecanum 欠驱动~0.19×）
-DEFAULT_ANG_SPEED = 1.5      # rad/s（提速：闭环读 imu 故转角仍准，只缩短时间；欠驱动~⅓）
+DEFAULT_LIN_SPEED = 1.2      # m/s（提速缩短单轮时长；闭环读真值位姿到点即停故距离仍准，安全由有向滤波兜底）
+DEFAULT_ANG_SPEED = 2.5      # rad/s（提速：每 vantage 4 次转向占大头，闭环读 imu 到角即停故转角仍准）
 #: 位姿 receive 超时：必须**大于**位姿话题周期（gps 10Hz=0.1s, imu 20Hz=0.05s），否则
 #: ws_manager.receive 超时会 close() 连接、丢掉订阅 → 闭环读不到位姿。0.5s 给足余量。
 POSE_RECV_TIMEOUT = 0.5
@@ -72,24 +72,46 @@ def shortest_angle_diff(a_deg: float, b_deg: float) -> float:
 def register_agent_action_tools(mcp: FastMCP, ws_manager: WebSocketManager) -> None:
     """注册高层动作/感知工具到 FastMCP 实例（仿 register_perception_tools）。"""
     ns = DEFAULT_NAMESPACE
-    cmd_vel = f"/{ns}/cmd_vel"
+    # 导航意图入口：发到 cmd_vel_nav，由 safety_node 有向过滤后中继到真正的 /{ns}/cmd_vel。
+    # （safety_node 是 /{ns}/cmd_vel 唯一发布者；它不在线则无 cmd_vel，机器人经 Webots 1.5s 超时归零。）
+    cmd_vel = f"/{ns}/cmd_vel_nav"
     twist_type = "geometry_msgs/msg/Twist"
     gps_topic = f"/{ns}/gps"
     imu_topic = f"/{ns}/imu"
     shm_path = f"/dev/shm/agent_safety_{ns}.json"
 
-    def _safety_tripped() -> bool:
-        """读 safety_node 写的 shm，tripped=True 则需立即停。"""
+    def _safety_flags() -> dict:
+        """读 safety_node 写的 shm，返回有向阻挡标志。读不到默认全 False
+        （与互锁配合：无 safety = 无 cmd_vel = 机器人本就不动）。"""
         try:
             with open(shm_path) as f:
-                return bool(json.load(f).get("tripped"))
+                s = json.load(f)
+            return {
+                "blocked_forward": bool(s.get("blocked_forward")),
+                "blocked_rear": bool(s.get("blocked_rear")),
+                "sensor_fault": (s.get("sensors_ok") is False),
+            }
         except Exception:  # noqa: BLE001
-            return False
+            return {"blocked_forward": False, "blocked_rear": False, "sensor_fault": False}
 
-    def _closed_loop(subs, twist: dict, is_done, timeout: float) -> tuple:
-        """闭环：advertise cmd_vel + subscribe subs，循环发 twist 直到 is_done(latest)/safety/超时；末尾零速。
+    def _motion_blocked(motion_kind: str) -> bool:
+        """按运动方向判停：前进看 blocked_forward、后退看 blocked_rear、旋转不因近障碍停；
+        传感器故障一律停。让机器人能转身/后退脱离死区（旧版 tripped 全量停会钉死）。"""
+        f = _safety_flags()
+        if f["sensor_fault"]:
+            return True
+        if motion_kind == "forward":
+            return f["blocked_forward"]
+        if motion_kind == "reverse":
+            return f["blocked_rear"]
+        return False   # rotate
+
+    def _closed_loop(subs, twist: dict, is_done, timeout: float, motion_kind: str = "forward") -> tuple:
+        """闭环：advertise cmd_vel_nav + subscribe subs，循环发 twist 直到 is_done(latest)/有向 safety/超时；末尾零速。
 
         subs: [(topic, msg_type), ...]，其最新消息累积进 latest 供 is_done 读。
+        motion_kind ∈ forward|reverse|rotate：只在该方向被近障碍挡住(或传感器故障)时才早退，
+        故后退/旋转能脱离死区（不再一见 tripped 就全量放弃）。
         返回 (status, latest, elapsed_s)。status ∈ done|safety_stop|timeout|error_*。
         """
         latest = {}
@@ -123,7 +145,7 @@ def register_agent_action_tools(mcp: FastMCP, ws_manager: WebSocketManager) -> N
                 status = "timeout"
                 deadline = t0 + timeout
                 while time.time() < deadline:
-                    if _safety_tripped():
+                    if _motion_blocked(motion_kind):
                         status = "safety_stop"
                         break
                     if is_done(latest):
@@ -173,7 +195,8 @@ def register_agent_action_tools(mcp: FastMCP, ws_manager: WebSocketManager) -> N
 
         timeout = (target / speed) * 6.0 + 6.0
         status, _, elapsed = _closed_loop(
-            [(gps_topic, "geometry_msgs/msg/PointStamped")], _twist(vx, 0.0), is_done, timeout)
+            [(gps_topic, "geometry_msgs/msg/PointStamped")], _twist(vx, 0.0), is_done, timeout,
+            motion_kind="forward" if distance_m > 0 else "reverse")
         return {
             "ok": status in ("done", "safety_stop"),
             "status": status,
@@ -206,7 +229,8 @@ def register_agent_action_tools(mcp: FastMCP, ws_manager: WebSocketManager) -> N
         wz = sign * DEFAULT_ANG_SPEED
         timeout = (math.radians(target_deg) / DEFAULT_ANG_SPEED) * 6.0 + 6.0
         status, _, elapsed = _closed_loop(
-            [(imu_topic, "sensor_msgs/msg/Imu")], _twist(0.0, wz), is_done, timeout)
+            [(imu_topic, "sensor_msgs/msg/Imu")], _twist(0.0, wz), is_done, timeout,
+            motion_kind="rotate")
         return {
             "ok": status in ("done", "safety_stop"),
             "status": status,
