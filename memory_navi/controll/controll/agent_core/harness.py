@@ -236,6 +236,8 @@ INSPECT_SYS = (
     "不要把背景/远墙框进来——框大了尺寸会算错)、confidence(0-1)。\n"
     "- 【不要自己报距离】——距离由系统按 bearing 从深度图读取，你只需把方位和框判断准。\n"
     "- 只报确实看清的；看不清/没把握/被遮挡就不要列，宁缺勿编；绝不列『猜应该有』的东西。\n"
+    "- 【只标完整呈现在视野内的物体】：若物体信息不全 / 太小太远 / 与相邻物体挤成一团分不清边界，"
+    "本次先不标，等走近能单独看清了再标（别把 桌子+显示器+柜子 框成一坨；这种远处一团宁可漏也不合并报）。\n"
     "- passable: [{direction:left/center/right, free:true/false, note:\"\"}] —— 哪侧地面开阔、哪侧被挡。\n"
     "- 若想看的东西明显偏在画面一侧，用 recenter_deg 给建议转向(+左/-右，度；不需要就 0)。\n"
     "只输出 JSON，不要其它文字：\n"
@@ -266,8 +268,115 @@ def _band_distance(depths: list, bearing: str):
     return round(min(valid_all), 2) if valid_all else None
 
 
+# ---------------------------------------------------------------------------
+# 混合标注（Phase A）：YOLO 出 ROI（定位）→ Qwen 逐框命名 + 弃权门（命名/判清晰）。
+# 不透题、不产坐标、不改 ROI；看不清/非完整呈现一律弃权，兜住 YOLO 幻觉/过度标注。
+NAME_BOXES_SYS = (
+    "你是室内机器人的语义记录员。代码已用检测器在画面上画好【若干带编号的蓝框】，"
+    "你只做一件事：逐框判断【是否看清 + 是什么】。\n"
+    "绝对不要：新增框 / 移动框 / 改框大小 / 报坐标或距离——这些都由代码负责。\n"
+    "对每个编号框，先判【完整度】再决定是否命名：\n"
+    "- completeness ∈ {完整, 部分, 勉强}：物体是否【几乎完整地】呈现在框内。\n"
+    "  被截断/大面积遮挡/太小太远/与相邻物挤成一团分不清边界 → 部分 或 勉强。\n"
+    "- 【只有 completeness=完整 才命名并 keep=true】；部分/勉强一律 name=null、keep=false（本次弃权，走近再说）。\n"
+    "弃权门（核心）：看不清 / 没把握 / 框住的更像【墙面·地板·天花板·踢脚线·工作台面·柜体侧板·梁·隔断】"
+    "或【门/通道】或【机器人自身】→ 一律 keep=false、name=null。"
+    "**框标错了就弃权，别配合它硬凑一个名字**；宁缺勿编。\n"
+    "【特别强调】即使框得完整清晰，只要是【地板·地面·墙面·天花板·踢脚线·门·通道·机器人自身/轮子/底盘】，"
+    "也一律 keep=false、name=null——绝不给这些起名。近距离只看到一整块颜色/平面、认不出是哪件家具时，也弃权。\n"
+    "命名规则：用【规范中文通用单数名】（沙发/显示器/办公桌/办公椅/柜子/绿植/厨台/水槽/键盘/吊灯 等）；"
+    "同一类物体恒用同一个名字；颜色/位置不要塞进名字。\n"
+    "只输出 JSON，不要其它文字（boxes 必须覆盖每个编号；漏掉的编号视为弃权）：\n"
+    "{\"boxes\":[{\"idx\":1,\"completeness\":\"完整\",\"name\":\"沙发\",\"keep\":true},"
+    "{\"idx\":2,\"completeness\":\"部分\",\"name\":null,\"keep\":false}]}"
+)
+
+
+def _parse_box_judgments(raw: str, box_ids: list) -> dict:
+    """纯函数：把 name_boxes 的模型输出解析成 {idx: {name, completeness, keep}}。
+
+    容错 code fence / 尾随文本（复用 _extract_obj）；**box_ids 里模型漏报的编号默认弃权**
+    （name=None, completeness='部分', keep=False——沉默即弃权）。可脱 vLLM 单测。
+    """
+    obj = _extract_obj(raw)
+    items = obj.get("boxes", []) if isinstance(obj, dict) else []
+    parsed = {}
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        try:
+            idx = int(it.get("idx"))
+        except (TypeError, ValueError):
+            continue
+        comp = it.get("completeness")
+        comp = comp if comp in ("完整", "部分", "勉强") else "部分"
+        name = it.get("name")
+        name = str(name).strip() if isinstance(name, str) and name.strip() else None
+        keep = bool(it.get("keep")) and comp == "完整" and name is not None
+        parsed[idx] = {"name": name if keep else None,
+                       "completeness": comp, "keep": keep}
+    for bid in box_ids or []:
+        parsed.setdefault(int(bid),
+                          {"name": None, "completeness": "部分", "keep": False})
+    return parsed
+
+
+def name_boxes(ex: Executor, look, boxes: list, *, name_hints: list = None,
+               max_tokens: int = 1200) -> dict:
+    """混合标注 Qwen 半：整图 + YOLO 编号框，一次调用批量判每框【完整度 + 命名/弃权】。
+
+    boxes: [{"idx":int, "roi":{x,y,w,h 0..1000}}]（YOLO 出的 ROI，像素锁定、不漂移）。
+    返回 {idx: {"name":str|None, "completeness":"完整|部分|勉强", "keep":bool}}。
+    与 inspect_and_report 同款【无状态一次性 vision completion】；Qwen 只命名/判清晰，
+    不产坐标、不改框（几何回填由代码用 YOLO 干净 ROI 在下游做）。
+    """
+    from agent_core.image_utils import ImagePart, _pil_to_jpeg_b64
+    import base64
+    import io
+    from PIL import Image as PILImage
+    import draw_dual_boxes
+
+    box_ids = [b.get("idx") for b in (boxes or []) if b.get("idx") is not None]
+    if look is None:
+        look = ex.ros.call("look", {})
+    img = look.images[0] if look.images else None
+    if img is None or not box_ids:
+        return {int(b): {"name": None, "completeness": "部分", "keep": False}
+                for b in box_ids}
+
+    # 解码原始帧 → 画编号框 → 重编码喂 Qwen（方案一：整图批量判，保留场景上下文）
+    base = PILImage.open(io.BytesIO(base64.b64decode(img.b64)))
+    annotated = draw_dual_boxes.draw_numbered_boxes(base, boxes)
+    part = ImagePart(b64=_pil_to_jpeg_b64(annotated, quality=90))
+
+    name_line = ""
+    if name_hints:
+        name_line = ("本区域已知物体（若框住的是它们，请沿用这些名称，不要另起名）："
+                     + "、".join(str(n) for n in name_hints) + "。\n")
+    user = (
+        f"{name_line}"
+        f"画面里有 {len(box_ids)} 个带编号的蓝框（编号 {sorted(box_ids)}）。\n"
+        "逐框判断完整度并命名/弃权，boxes 覆盖每个编号（JSON）。"
+    )
+    content = [{"type": "text", "text": user}, to_openai_image_url(part)]
+    raw = ""
+    for _ in range(2):
+        resp = ex.client.chat.completions.create(
+            model=ex.model,
+            messages=[{"role": "system", "content": NAME_BOXES_SYS},
+                      {"role": "user", "content": content}],
+            temperature=0.2,
+            max_tokens=max_tokens,
+            stream=False,
+        )
+        raw = (resp.choices[0].message.content or "").strip()
+        if raw.endswith("}"):
+            break
+    return _parse_box_judgments(raw, box_ids)
+
+
 def inspect_and_report(ex: Executor, *, area_hint: str = "", max_tokens: int = 1000,
-                       name_hints: list = None) -> dict:
+                       name_hints: list = None, look=None) -> dict:
     """到位后的一次语义巡检：look + scan + depth 喂给 Qwen，让它报【物体+方位+bbox+可通行方向】，
     距离由代码按 bearing 从 depth 列接地（不采纳模型自报的数字，杜绝距离幻觉）。
 
@@ -277,7 +386,8 @@ def inspect_and_report(ex: Executor, *, area_hint: str = "", max_tokens: int = 1
     返回 {objects, passable, recenter_deg, note, scan, depth, pose, image, raw}。
     image 供调用方核验图文一致；导航与控制流都不在这里。
     """
-    look = ex.ros.call("look", {})
+    if look is None:                          # 允许注入同一帧（双标注对比：Qwen/YOLO 看同一张图）
+        look = ex.ros.call("look", {})
     img = look.images[0] if look.images else None
     scan_text = ex.ros.call("scan_summary", {}).text
     depth_text = ex.ros.call("depth_summary", {}).text

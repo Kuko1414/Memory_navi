@@ -12,6 +12,12 @@ memory_navi/memory/
 
 # 大文件不推 GitHub
 paper/*.pdf
+*.pt
+*.safetensors
+mobileclip2_b.ts
+*.ts.pt
+Report/hybrid_review*/imgs_*/
+Report/dual_review/imgs_*/
 memory_navi/ros-mcp-server/examples/*/images/*.gif
 memory_navi/ros-mcp-server/examples/*/images/*.png
 memory_navi/ros-mcp-server/docs/images/*.gif

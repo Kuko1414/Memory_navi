@@ -4,6 +4,112 @@
 
 ---
 
+## 7.6 Sunday: 混合标注全栈实跑 7 轮 + 均匀网格覆盖 → 召回天花板=相机高度（详见 Process.md 阶段十四）
+
+### 本会话落地（代码+单测绿、实测跑通、待提交）
+- **YOLO 权重损坏修复**：`mobileclip2_b.ts` 被 ultralytics 无代理自动下载成 202MB 截断（首轮 120s"超时"实为下载失败），
+  用仓库根 242MB 有效副本覆盖 → 冷加载 3.6s、0 失败。`.gitignore` 补 `mobileclip2_b.ts`。
+- **禁记类硬过滤**（`_FORBIDDEN_NAMES`/`_process_rep`）：代码丢 地板/墙/天花板/门/机器人自身 → 记忆 0 残留。
+- **Qwen 全图也看一遍**：混合每帧 = YOLO 框命名 ∪ Qwen 全图 inspect（补 YOLO 漏检）。
+- **观测站距 0.5→0.7m**：关键是 `pf.OBS_MIN_CLEAR_M`（观测点质量门=车真正停车距离；先只改标注侧没用，补这个才生效）。
+- **常驻 YOLO 服务** `yolo_service.py`：模型只加载一次，不再每帧 subprocess+重载，0 失败。
+- **单帧共现反合并**（`COOCCUR_EPS_M`）：同帧同名 abs_pose 差>0.2m=两实例禁并（治密集同名家具间距≈坐标噪声）。
+- **评分：显示器东×4→region「东区」**（用户认可，GT observable 20→17）：0.13m 相机分不出 0.5m 间距的个数,整片算1召回点。
+- **均匀网格覆盖** `_grid_coverage`（**取代 frontier 密度 + Claude 调度官**）：bbox 内 1.8m 铺格,最近未覆盖格→路由→柔性环视→
+  标覆盖;网格满则穿插推 frontier 扩张 bbox。治"往一个方向扎、极角落漏"。修两 bug(开局误判全覆盖退出/标漂移站位致同格死循环)。
+- **navigator._pose 加固**：保证含 yaw_deg(重试+补默认),治瞬时坏读 KeyError 崩整轮。
+
+### 召回轨迹(GT17,混合)与最终结论
+`40→30→45→47→47→47`。**v6c 均匀网格把车开到南墙前 1.2m(厨台/水槽/矮柜),但照样漏——已不是覆盖是识别**:低矮物体
+0.13m 相机 1.2m 处低于台面认不出。**召回天花板彻底=相机高度(0.13m)**。覆盖(均匀网格正解)+感知软件(过滤/去重/merge)到头且干净。
+**唯一正交杠杆=抬相机 0.13→~0.8m**(一直往后放)。
+
+### "为什么无 YOLO 能到 65%"(用户问,git 取证)
+**65% 是真的**(同 GT observable=20,13/20)。但那是提交 `2fe4994` 的**纯 Qwen 精简版(702 行)**——git 证实**无** FAR_LABEL_M
+距离门/Claude 调度官/整理官,这仨是**下次提交 `23ee29d` 才加**。落差主因:①**距离门 FAR_LABEL_M=2.5** 大房间丢>2.5m 合法物(65%版没这门,最大嫌疑);
+②Claude 调度官方差(已用均匀网格取代);③跨轮车漂移(7轮没 Webots 复位)+单轮方差。**教训:23ee29d 那批"精度/防幻觉"改动用召回换精度、可能过度**。
+
+### 下一步(用户定):从"怎么记录"转向"如何整理"
+用户判读"结果还可以,漏的主要是仿真精度/视角",定**关键在整理不在记录**。现整理层薄=去重+每簇选个名 → **扁平32物体清单**,
+缺:①功能子区结构 ②空间/从属关系 ③真语义 summary ④**用空间上下文纠单点误标**(consolidate 只看簇内不看邻居)。**目标=词典式结构化记忆**
+(对齐 proposal STG+区域JSON):A 功能子区结构化(office/kitchen/lounge 各带范围+成员+摘要) + B 上下文纠错(办公区孤立"柜子"多半是桌,救东office误标) + C 关系(on/in)。倾向 A+B。
+关联 [[hybrid-perception-yolo-roi-qwen-name]] [[layered-harness-code-nav-vlm-semantics]] [[explore-coverage-variance-obsgate]]。
+
+---
+
+## 7.6 续: 混合标注 Phase A+B 落地 —— 弃权门验证实验（详见 Process.md 阶段十三）
+
+### 本会话已落地（代码+单测绿+装配 smoke 通过、未提交；**端到端实跑需全栈，本会话未跑**）
+- **Phase A 可复用件（纯函数优先）**：
+  - `yoloe.py`：`raw_detections_to_boxes`（YOLO 低 conf `raw_detections`→只带 idx/roi/center/conf/label 的框，**不套 canonical_name**、
+    label-agnostic）+ `assemble_hybrid_objects`（只留 `keep and 完整 and 有名`，保 YOLO ROI+Qwen name+`verified_by=["hybrid"]`，**不产坐标**）。
+  - `harness.py`：`NAME_BOXES_SYS`（弃权门 prompt：先判完整/部分/勉强，**只"完整"才命名 keep=true**；框标错就弃权别配合编名）+
+    `name_boxes`（无状态一次性 vision completion，**方案一=整图画编号框一次批量判**）+ 纯 `_parse_box_judgments`（容错+漏报默认弃权）。
+  - `draw_dual_boxes.py`：`draw_numbered_boxes`（复用 `_roi_px`/`_load_font`，画蓝框+大号编号，返回 PIL）。
+- **Phase B 弃权门验证实验（`HYBRID_REVIEW_DIR`，镜像 `DUAL_REVIEW_DIR`）**：`explore_probe.py` 加 `_hybrid_yolo_boxes`（消费
+  `raw_detections`）、`_sweep_vantage` hybrid 分支（混合作驱动、同帧 Qwen-only inspect 作基线旁路）、`_hybrid_review_dump`
+  （逐帧存 raw+**编号框图=Qwen 实际所见**+每框 YOLO/Qwen 判定+两路留存）、`_finalize_hybrid_review`/`_write_hybrid_index`
+  （`area_hybrid` vs `area_baseline` 各 `score_explore` 打分 + `index.md`）。产物 `Report/hybrid_review/`。
+- **单测全绿**：`test_{hybrid_assemble,name_boxes_parse,numbered_drawer}.py`；pycodestyle 新增代码零违规；`import explore_probe`
+  全链路 smoke（YOLO 框→Qwen 判定→装配出 `办公椅`@YOLO ROI）通过。
+
+### 范围与判据（用户定）
+只做到验证实验就停：跑一轮存图存判定供人工/Claude 审。**弃权门通过判据**：对 YOLO 的墙/半截物/空墙框 Qwen `keep=false` 可靠弃权
++ 混合召回 ≥ Qwen-only 基线（≥0.70）。通过再开工 `PERCEPTION_BACKEND=hybrid`（Phase C）。**风险**：每帧 YOLO 重载慢（先接受）；
+完整度门 vs 召回张力（须同时报召回）；`_annotation_ok` FAR 门需回填后补远距丢弃。关联 [[hybrid-perception-yolo-roi-qwen-name]]。
+
+---
+
+## 7.5 续: 深度过滤修复 + 双标注对比 → 定案混合标注架构（详见 Process.md 阶段十二）
+
+### 本会话已落地（代码+单测绿、flake8 干净、未提交）
+- **深度反证治幻觉**：`explore_probe` 加 **occ 空旷反证**(`_occupancy_phantoms`，abs_pose 落已扫空旷自由格+邻域无 occupied→丢，
+  贴墙真家具豁免) + **LOS 穿墙反证**(`_backfill_geometry_local` 串 occ，观测→坐标视线穿 occupied→丢)。单测 `test_occupancy_phantom.py`(7项)。
+  **修正**：上轮"车冲出房间 x=-5.6"是 Claude 幻觉（仅一房间），非真 bug，未修。
+- **双标注对比工具**：`DUAL_REVIEW_DIR` 同轨迹**同帧**同跑 Qwen+YOLO，各建记忆图分别 `score_explore` 打分；`harness.inspect_and_report(look=)`
+  注入共享帧；`draw_dual_boxes.py`(Noto CJK 字体画中文框，绿=留存/橙=过滤)出三图并列 index。产物 `Report/dual_review/`。
+- **YOLO 审阅实验** `YOLOE_REVIEW_DIR`：存 YOLO 画框图+坐标+打分 → `Report/yolo_gate_experiment/`。
+
+### 双标注实测（同轨迹同帧，用户判读）
+- **Qwen**：ROI **漂移严重**(坐标错)、命名准、**少幻觉**，但平 0.9 过度自信、桌上一排报成 3 显示器。
+- **YOLO**：ROI **锁死不漂移**(坐标准)、**爱幻觉**(空墙高置信)、命名 OOD 乱标、**过度标注**(半截柜子→桌/沙发)、静默漏检。
+- 召回单轮 Qwen 6/20 vs YOLO 10/20（**噪声大、别过读**；稳定结论是**定性互补**）。
+
+### 定案：混合标注架构（用户定，取代 §11.6 硬门）
+**YOLO 出 ROI(定位)→Qwen 读 ROI 出 ID/名(命名)→代码 depth 映射+坐标重合过滤→入记忆。** 关键 **Qwen 弃权门**：不死板标每个 ROI，
+看不清/不确定/形态非几乎完整呈现的**一律不标**→筛掉 YOLO 误标的墙/柜/工作台（不再要求 YOLO 无幻觉）。Claude 补充：弃权门是命门须先验证
+(Qwen 平0.9 过度自信是威胁)、YOLO conf 要放低(漏检=召回天花板)、相机高度仍是物理天花板。关联 [[hybrid-perception-yolo-roi-qwen-name]]
+[[dual-annotator-comparison]] [[yolo-perception-camera-height]]。
+
+---
+
+## 7.5 Saturday: YOLO 感知支线验证 + 混合架构决策（详见 Process.md 阶段十一）
+
+### YOLO 部署（Codex+本会话，代码后端，未提交）
+- 独立 `yolo` conda env（CPU torch 2.12 + ultralytics 8.4.87 + CLIP fork；GPU 被 vLLM 8B 占满仅剩 5.6G 故走 CPU，~30ms/图）。
+- `agent_core/perception/yoloe.py`（纯转换函数：0..1000 ROI / 英类→中文名表 / 低 conf 过滤，可脱 YOLO 单测）；
+  探针 `yolo_offline_probe.py`/`yolo_live_probe.py`；`explore_probe` 加 `PERCEPTION_BACKEND=qwen|yoloe` 开关。测全绿。
+- **`mobileclip2_b.ts`(YOLOE 开集依赖 242MB)走 clash 代理 127.0.0.1:7897 ~10MB/s 25s 下完**（直连 GitHub 20-30KB/s）。权重在仓库根、已 gitignore。
+
+### 关键结论（当前相机高度 0.13m）
+- **YOLO 不是 Qwen 可调工具**：MCP 无 yolo 工具、prompt 未提；且 **explore 无 Qwen FC**（确定性编排 + Qwen 当标注器）。yoloe 是代码后端替换。
+- **闭集不够**：普通 yolo26n(COCO)缺柜子/办公桌/门只出绿植；**必须开集(YOLOE)或微调**。
+- **YOLO 单独用没救回**：live 召回 **5/20=25% FAIL**（vs Qwen 65%）。17 记录=命中5/误标6/幻觉5。离线家具 conf 0.04~0.11(静默漏检)、绿植 0.71。
+- **根因精化（不是"距离"，是"视角+域"）**：相机 z=0.13m 极端低仰角(看桌底/侧棱)= 姿态 OOD + Webots 合成纹理 = 外观 OOD →
+  区域 embedding 落训练流形外 → 开集 softmax **近随机 argmax**(误标 conf 0.28~0.44) → **A 标成 B**。坐标错 ≠ YOLO 算法，是**幻觉框反投到墙面**
+  + **覆盖 bug 车冲出房间**(x=-5.6 虚空)。**YOLO 在合成域也高置信度幻觉(空墙绿植 conf 0.68)→ 推翻"YOLO 不幻觉"。**
+- **失败模式互补**：Qwen 会命名不会定位(ROI 漂)+爱幻觉；YOLO 会定位(框锁像素)不会命名(OOD 误标)+静默漏检。**→ 引出混合架构。**
+
+### 用户定的新方向（交下一会话，详见 Process.md §11.6）
+1. **深度过滤优化**（位置错=深度/几何过滤不完善；先修 §11.5 两 bug：占用兜底冲出房间 + 深度放行幻觉位置）。
+2. **YOLO 分割 + Qwen 解读语义一起注入记忆**：代码实现但**要教会 Qwen 参与语义解读**（≠ 纯代码后端）。
+3. **YOLO 当 Qwen 的门**：只有 YOLO 标出的才让 Qwen 识别、不标不识别（治静默漏检+幻觉）。**必须先跑前置实验证明**：①YOLO 标的 Qwen 都能对；
+   ②YOLO 无幻觉标注。**方法：把一次实验 YOLO 看到的所有图 + 标注位置存本地供人+Claude 审阅。** 备注：0.13m 下大概率不成立 → 实质是相机高度实验。
+4. **相机高度仍是首要物理根因**；YOLO 置信度是干净量尺（跳到 0.5+ = 确认根因是相机）。
+- 关联 [[explore-coverage-variance-obsgate]] [[precision-over-recall-explore]] [[no-answer-leak-to-qwen]]。
+
+---
+
 ## 6.22 Monday: 执行工具层 + 闭环运动 + harness 加固（幻觉 vs 不收敛 实验）
 
 ### 1. 精选动作/感知 MCP 工具（`ros-mcp-server/ros_mcp/tools/`，新文件 additive，不动 vendored 上游）

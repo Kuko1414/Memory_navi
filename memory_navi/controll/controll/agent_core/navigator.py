@@ -19,10 +19,23 @@ def _norm_deg(a: float) -> float:
 
 
 def _pose(ex) -> dict:
-    p = json.loads(ex.ros.call("get_pose", {}).text)
-    if "x" not in p:  # timeout/error → retry once
-        import time; time.sleep(0.5)
-        p = json.loads(ex.ros.call("get_pose", {}).text)
+    """get_pose 真值位姿；保证含 x/y/yaw_deg（残缺=瞬时读失败 → 重试；仍缺则补默认，
+    绝不让一次坏读用 KeyError 崩掉整轮探索——宁可这帧转不准，下一次读会恢复）。"""
+    import time
+    p = {}
+    for _ in range(3):
+        try:
+            p = json.loads(ex.ros.call("get_pose", {}).text)
+        except (ValueError, TypeError):
+            p = {}
+        if isinstance(p, dict) and "x" in p and "yaw_deg" in p:
+            return p
+        time.sleep(0.4)
+    if not isinstance(p, dict):
+        p = {}
+    p.setdefault("x", 0.0)
+    p.setdefault("y", 0.0)
+    p.setdefault("yaw_deg", 0.0)
     return p
 
 
@@ -138,6 +151,7 @@ def geo_goto_around(
     max_legs: int = 24,
     max_step_m: float = 1.0,
     front_block_m: float = 0.6,
+    clear_margin_m: float = 0.25,
     wall_step_m: float = 0.7,
     slide_deg: float = 90.0,
     backoff_m: float = 0.35,
@@ -176,7 +190,11 @@ def geo_goto_around(
         clear = front is None or front >= front_block_m
 
         if clear:
-            mv = json.loads(ex.ros.call("move", {"distance_m": round(min(dist, max_step_m), 2)}).text)
+            # 直冲按前向实测余量封顶（同 VFH geo_step_open）：别一步冲到贴墙触发 safety 退避。
+            cap = min(dist, max_step_m)
+            if front is not None:
+                cap = min(cap, max(0.15, front - clear_margin_m))
+            mv = json.loads(ex.ros.call("move", {"distance_m": round(cap, 2)}).text)
             trav = mv.get("traveled_m", 0) or 0
             if mv.get("status") != "safety_stop" and trav >= 0.08:
                 steps.append(f"{leg}:direct move={round(trav,2)} dist={round(dist, 2)} pose=({round(p['x'],2)},{round(p['y'],2)})")
@@ -193,8 +211,14 @@ def geo_goto_around(
         ex.ros.call("move", {"distance_m": -round(backoff_m, 2)})   # 退后解钉
         tool = "turn_left_deg" if side == "left" else "turn_right_deg"
         ex.ros.call(tool, {"degrees": slide_deg})
-        mvw = json.loads(ex.ros.call("move", {"distance_m": wall_step_m}).text)
-        steps.append(f"{leg}:slide {side} back{backoff_m}+turn{slide_deg}+fwd moved={mvw.get('traveled_m')} {mvw.get('status')}")
+        # 转向后重感知再封顶滑行步长：别盲滑 wall_step 撞到新墙。
+        side_front = _scan(ex).get("front_min_m")
+        step = wall_step_m
+        if side_front is not None:
+            step = min(wall_step_m, max(0.15, side_front - clear_margin_m))
+        mvw = json.loads(ex.ros.call("move", {"distance_m": round(step, 2)}).text)
+        steps.append(f"{leg}:slide {side} b{backoff_m}+t{slide_deg}+f{round(step, 2)} "
+                     f"moved={mvw.get('traveled_m')} {mvw.get('status')}")
 
     p = _pose(ex)
     dist = math.hypot(tx - p["x"], ty - p["y"])
@@ -299,3 +323,30 @@ def geo_route(ex, waypoints, **kw) -> dict:
             break
     last = legs[-1] if legs else {"pose": _pose(ex)}
     return {"arrived": status == "arrived", "legs": legs, "pose": last["pose"], "status": status}
+
+
+def geo_route_around(ex, waypoints, **kw) -> dict:
+    """按顺序【geo_goto_around（能绕行）】经过一串路点——门导向 waypoint 桥接的执行原语。
+
+    与 geo_route 的区别：每段用反应式绕行的 geo_goto_around（撞墙不放弃、贴墙滑行），而非直线 geo_goto。
+    实证（Step 0.2）：反应式直冲穿不了长墙(墙前横跳)；但"北上走廊→穿开口横轴→南下"的多路点 + 本函数
+    逐段绕行，能把车从西侧起点带过 wall(1) 北缝进东侧办公区（[(1.8,1.5),(3.2,1.4),(3.5,-0.6)] 三腿全到）。
+    供 explore 覆盖回路：当目标候选在检测到的墙/开口另一侧时，代码据几何构造走廊路点再调本函数。
+
+    waypoints: [(x,y), ...]（不含起点）。任一段未到位即中止并上报。返回 {arrived, legs, pose, status}。
+    """
+    legs = []
+    status = "arrived"
+    total_steps = 0
+    for i, (wx, wy) in enumerate(waypoints):
+        leg = geo_goto_around(ex, wx, wy, **kw)
+        ns = len(leg.get("steps") or [])
+        total_steps += ns
+        legs.append({"wp": [wx, wy], "n_steps": ns,
+                     **{k: leg[k] for k in ("arrived", "dist_m", "status", "pose")}})
+        if not leg["arrived"]:
+            status = f"stuck@wp{i}:{leg['status']}"
+            break
+    last = legs[-1] if legs else {"pose": _pose(ex)}
+    return {"arrived": status == "arrived", "legs": legs, "pose": last["pose"],
+            "status": status, "n_steps": total_steps}

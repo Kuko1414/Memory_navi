@@ -167,6 +167,26 @@ class AnthropicProvider:
         except Exception:  # noqa: BLE001
             return {}
 
+    def pick_viewpoint(self, payload: dict) -> dict:
+        """Claude 观测点选择官（Task 2，每个 vantage 前一次，纯文本、看势场 ASCII 不读图）。
+
+        代码用雷达势场筛好候选观测点，Claude 只【从候选选一个 id】站得离障碍适中、朝目标视野好——
+        绝不产坐标（防幻觉，同 plan_coverage）。返回 {target_id, rationale}；异常/超时/空 → {}。
+        """
+        try:
+            text = _build_viewpoint_prompt(payload)
+            resp = self._client.messages.create(
+                model=self._model,
+                max_tokens=300,
+                system=SYSTEM_PICK_VIEWPOINT,
+                messages=[{"role": "user", "content": text}],
+            )
+            raw = "".join(b.text for b in resp.content if getattr(b, "type", None) == "text")
+            obj = _extract_json(raw or "")
+            return obj if isinstance(obj, dict) else {}
+        except Exception:  # noqa: BLE001
+            return {}
+
     def consolidate_memory(self, records: list) -> dict:
         """Claude 记忆整理官（Role-2，探索写盘前一次，纯文本、不读图）。
 
@@ -195,18 +215,43 @@ class AnthropicProvider:
 
 SYSTEM_PLAN_COVERAGE = (
     "你是室内机器人的【探索覆盖调度官】。你【看不到图像】——只收到代码算出的紧凑符号地图："
-    "房间 bbox、按 NE/NW/SE/SW 切的四象限覆盖统计、已记录物体的世界坐标、以及一份【代码筛好的候选目标格】。\n"
-    "你的唯一任务：判断哪个象限【欠覆盖】(coverage 低且仍有可达空洞)，从 candidates 里【选一个 id】"
-    "作为机器人下一个要去补扫的目标点。\n"
+    "房间 bbox、occupancy 覆盖计数(free/occupied/visited/frontier)、按 NE/NW/SE/SW 切的四象限覆盖统计、"
+    "已记录物体的世界坐标、以及一份【代码筛好的候选目标点】。\n"
+    "候选是 **occupancy frontier 可达点**——已探明自由空间与【未知区】的交界；代码已确保每个都能 A* 走到"
+    "（含穿隔断墙缺口进被遮挡区）。\n"
+    "你的唯一任务：从 candidates 里【选一个 id】作为机器人下一个补扫目标，优先把覆盖推进到【未探索 / 被隔断"
+    "遮挡】的方向（frontier 密、物体少的欠覆盖象限）。\n"
     "硬性规则：\n"
     "1. target_id 必须是 candidates 里真实存在的 id；【绝不自己编造坐标或不存在的 id】。\n"
-    "2. 候选里 reopen_blocked=true 的是被代码判死但疑似『假墙』的格，可以选它让机器人 scan 复核；"
-    "但 last_rejected_reopen 里的格已确认是真墙，不要再选它。\n"
-    "3. 优先补【coverage 最低且 under_covered=true】的象限；被遮挡的凹区(物体少但可能藏东西)也值得去。\n"
-    "4. 四象限都已足够覆盖(无明显 under_covered 象限)时，返回 done:true。\n"
+    "2. 优先补【coverage 最低且 under_covered=true】的象限；被遮挡的凹区(物体少但可能藏东西)也值得去。\n"
+    "3. frontier 已耗尽 / 候选都落在已充分覆盖处时，返回 done:true。\n"
     "只输出一个合法 JSON(不要代码块标记、不要解释)："
-    "{\"done\":false,\"target_quadrant\":\"NE|NW|SE|SW\",\"target_id\":\"c3\",\"reopen\":false,\"rationale\":\"≤120字\"}"
+    "{\"done\":false,\"target_id\":\"c3\",\"rationale\":\"≤120字\"}"
 )
+
+
+SYSTEM_PICK_VIEWPOINT = (
+    "你是室内机器人的【观测点选择官】。你【看不到图像】——只收到代码用雷达算出的局部【势场 ASCII 图】"
+    "和一份【代码筛好的候选观测点】(每个含 id、世界坐标 x,y、clearance=离最近障碍距离米)。\n"
+    "ASCII 图例：R=车当前位置 T=想观测的目标 数字=候选观测点 #=贴障碍(危险) +=近障碍带 .=开阔；北在上、东在右。\n"
+    "你的唯一任务：从 candidates 里【选一个 id】作为机器人下一步要去站的观测点，要求：\n"
+    "1. 离障碍适中(clearance 别太小=会贴墙/钻桌底看不清，也别太大=离目标太远)，站位开阔、朝 T 视野好；\n"
+    "2. target_id 必须是 candidates 里真实存在的 id；【绝不自己编造坐标或不存在的 id】；\n"
+    "3. 候选为空 / 都不理想时返回 {\"target_id\":null}，代码会用默认目标点兜底。\n"
+    "只输出一个合法 JSON(不要代码块、不要解释)："
+    "{\"target_id\":\"v2\",\"rationale\":\"≤80字\"}"
+)
+
+
+def _build_viewpoint_prompt(payload: dict) -> str:
+    return "\n".join([
+        "=== 局部势场图(北上/东右) ===",
+        str(payload.get("ascii_field", "")),
+        f"车位姿: {json.dumps(payload.get('pose', {}), ensure_ascii=False)}",
+        f"目标点 target_xy(想观测的对象/区域): {json.dumps(payload.get('target_xy'), ensure_ascii=False)}",
+        f"候选观测点(只能从这里选 id): {json.dumps(payload.get('candidates', []), ensure_ascii=False)}",
+        "从候选里选一个站位最好的观测点 id（离障碍适中、朝目标视野好）。候选空/都不好则 target_id:null。只输出 JSON。",
+    ])
 
 
 SYSTEM_CONSOLIDATE = (
@@ -238,12 +283,12 @@ def _build_plan_prompt(payload: dict) -> str:
     return "\n".join([
         "=== 房间覆盖现状(数字单位米，已 round 到 0.1) ===",
         f"bbox: {json.dumps(payload.get('bbox', {}), ensure_ascii=False)}",
+        f"occupancy 覆盖计数: {json.dumps(payload.get('coverage', {}), ensure_ascii=False)}",
         f"四象限统计: {json.dumps(payload.get('quadrants', {}), ensure_ascii=False)}",
         f"已记录物体: {json.dumps(payload.get('objects', []), ensure_ascii=False)}",
-        f"候选目标格(只能从这里选 id): {json.dumps(payload.get('candidates', []), ensure_ascii=False)}",
-        f"已确认真墙(别再选): {json.dumps(payload.get('last_rejected_reopen'), ensure_ascii=False)}",
+        f"候选 frontier 目标点(只能从这里选 id): {json.dumps(payload.get('candidates', []), ensure_ascii=False)}",
         f"轮次: {payload.get('round')}  剩余轮次: {payload.get('rounds_left')}",
-        "请选出下一个要去补扫的欠覆盖象限与候选 id（都覆盖够了就 done:true）。只输出 JSON。",
+        "请选出下一个要去补扫的候选 id（frontier 耗尽/都覆盖够了就 done:true）。只输出 JSON。",
     ])
 
 

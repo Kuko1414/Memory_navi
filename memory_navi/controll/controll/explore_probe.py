@@ -13,10 +13,13 @@ scan 复核假墙、VFH 去补、物体格停 ≥0.5m）→ STAGE C frontier 兜
 
 运行：conda run -n vllm python explore_probe.py（需 ANTHROPIC_AUTH_TOKEN + ANTHROPIC_BASE_URL gateway）。
 """
+import base64
 import json
 import math
 import os
 import re
+import shutil
+import subprocess
 import sys
 import time
 
@@ -32,16 +35,44 @@ from agent_core import navigator as nav
 from agent_core.cloud.providers import AnthropicProvider
 from agent_core.executor import Executor
 from agent_core.geometry import depth_projection as dp
+from agent_core.geometry import occupancy as oc
+from agent_core.geometry import potential_field as pf
 from agent_core.memory.fs_memory import FsMemory
+from agent_core.perception import yoloe
 
 AREA = "explore_room"          # 独立 area，不碰 autonomy_probe 的 break_room 记录
 RUN_OUT = os.path.join(REPORT_DIR, "explore_run.json")
 START_XY = (-0.5, -1.0)        # 休息室起点（初始条件，非答案）
 START_TOL_M = 1.5
 
+# 感知后端：默认仍用 Qwen；YOLOE 仅替换物体+ROI 来源，不动导航/门/写盘路径。
+PERCEPTION_BACKEND = os.environ.get("PERCEPTION_BACKEND", "qwen").strip().lower()
+YOLOE_PYTHON = os.environ.get("YOLOE_PYTHON", "/home/kuko/miniconda3/envs/yolo/bin/python")
+YOLOE_MODEL = os.environ.get("YOLOE_MODEL", yoloe.DEFAULT_MODEL)
+YOLOE_DEVICE = os.environ.get("YOLOE_DEVICE", "cpu")
+YOLOE_CONF = float(os.environ.get("YOLOE_CONF", str(yoloe.DEFAULT_CONF)))
+YOLOE_TIMEOUT_S = float(os.environ.get("YOLOE_TIMEOUT_S", "120"))
+YOLOE_TMP_DIR = os.environ.get("YOLOE_TMP_DIR", "/tmp/yoloe_explore")
+# 审阅实验：非空则把每朝向 YOLO 画框标注图 + 检测(含反投世界坐标)存该目录，供人+Claude 审阅
+# 「①YOLO 标的 Qwen 能否识别 ②YOLO 是否幻觉标注」（见 Process.md §11.6-3）。默认空=不影响现有流程。
+YOLOE_REVIEW_DIR = os.environ.get("YOLOE_REVIEW_DIR", "").strip()
+# 双标注对比实验：非空则同一轨迹同一帧【同时】跑 Qwen 与 YOLO 两个标注器，逐帧存原图 + 各自标注清单，
+# 各建一张记忆图并用 score_explore.py 分别打分，全部落该目录，供审阅「各标什么/ID是什么/各错在哪」。
+DUAL_REVIEW_DIR = os.environ.get("DUAL_REVIEW_DIR", "").strip()
+# 混合标注·弃权门验证实验（Phase B）：非空则同一帧【YOLO 出低 conf ROI → Qwen 逐框命名+完整度判定】作驱动，
+# 【同帧再跑 Qwen-only inspect】作基线对照；逐帧存原图+编号框图+每框判定，两路各建记忆图分别打分。
+# 供人+Claude 审「弃权门能否可靠弃 YOLO 的墙/半截物/空墙框」。默认空=不影响现有流程。
+HYBRID_REVIEW_DIR = os.environ.get("HYBRID_REVIEW_DIR", "").strip()
+HYBRID_YOLO_CONF = float(os.environ.get("HYBRID_YOLO_CONF", "0.05"))  # 低 conf 多提议保召回，靠弃权门兜假阳
+_REVIEW_SEQ = [0]             # 全局递增序号（脚本内唯一命名，不用时间/随机）
+_VANTAGE_SEQ = [0]           # 全局递增 vantage 序号（供审阅定位是第几个观测点）
+_YOLO_RECORDS = []          # 双标注模式下 YOLO 旁路的逐 vantage 记录（另建 YOLO 记忆图打分）
+_BASELINE_RECORDS = []      # 混合验证模式下 Qwen-only 基线旁路记录（另建基线记忆图对照打分）
+
 # —— 覆盖收敛参数（代码持有覆盖保证；vantage=云端标注成本上限，nav_steps=平移硬上限，两者解耦）——
-MAX_VANTAGES = 18             # 全景视角上限（从26降，缩短单轮：recon~6 + 调度官~6 + 兜底~6 足够铺满单间）
-MAX_NAV_STEPS = 130          # 平移步(geo_step_open)硬上限，与 vantage 解耦的安全兜底（随屋大调高）
+MAX_VANTAGES = 26            # 全景视角上限（18→26：恢复稳定65%版覆盖预算；实测大三区房间(西office+中+东office)
+#                             用18点铺不满、西办公区整片漏，18那版召回从65%退到30-40%。见阶段十三点2）
+MAX_NAV_STEPS = 180          # 平移步(geo_step_open)硬上限（130→180：配合26点覆盖大房间+够远探到西办公区）
 MIN_VANTAGE_SPACING_M = 1.0  # 新 vantage 距上一个 vantage 至少这么远才环视（防 _drive_to 卡住时原地重扫浪费）
 STUCK_LIMIT = 2              # 连续 STUCK_LIMIT 轮净位移<阈值 → 触发脱困/放弃
 
@@ -85,7 +116,43 @@ def _qwen_obj_abs_pose(o, pose):
         return None
 
 
-def _backfill_geometry_local(ex, objects, view_pose):
+# 禁记类（建筑表面 / 门作为物体 / 机器人自身）——代码层硬过滤，不靠模型自觉（实测 Qwen 会把
+# 近距离红柜看成"门"、把桌面/地板报成"地板"、偶把自身报成"机器人"）。门另经 advisor→doors_raw 记入
+# 拓扑边，故从 objects 里丢；地板/墙/天花板/踢脚线/自身一律不入物体库。
+_FORBIDDEN_NAMES = {
+    "地板", "地面", "floor",
+    "墙", "墙面", "墙壁", "wall",
+    "天花板", "ceiling", "踢脚线", "梁", "隔断", "隔断墙", "partition",
+    "门", "门口", "通道", "door", "doorway", "gate",
+    "机器人", "机器人本体", "底盘", "轮子", "robot", "wheel", "self", "chassis",
+}
+
+
+def _is_forbidden_name(name):
+    """建筑表面/门/机器人自身等禁记类 → True（代码硬过滤，见 _process_rep）。"""
+    return _norm_name(name) in _FORBIDDEN_NAMES
+
+
+def _annotation_ok(o):
+    """Task 3 标注过滤谓词：远距离过报 / 视野过小(团在一起) → 丢弃。返回 (ok, reason)。
+
+    只用 Qwen 输出 + 代码接地距离(distance_m)，在几何回填【前】过滤：省一次脏 ROI 的深度读，
+    也避免远/团物体污染去重。见 Report/qwen_labeling_issue/README.md 对策①。
+    """
+    dist = o.get("distance_m")
+    if isinstance(dist, (int, float)) and dist > FAR_LABEL_M:
+        return False, f"dist {dist:.2f}m>{FAR_LABEL_M}m(远距离过报)"
+    roi = o.get("roi")
+    if isinstance(roi, dict):
+        _, _, w, h = dp._roi_to_frac(roi)
+        if w * h < MIN_ROI_AREA_FRAC:
+            return False, f"roi面积 {w * h:.4f}<{MIN_ROI_AREA_FRAC}(视野过小)"
+        if min(w, h) < MIN_ROI_DIM_FRAC:
+            return False, f"roi最短边 {min(w, h):.3f}<{MIN_ROI_DIM_FRAC}(视野过小)"
+    return True, ""
+
+
+def _backfill_geometry_local(ex, objects, view_pose, occ=None):
     """方法B 几何回填：对带 roi 的 Qwen 物体，读一帧 depth 批量算 size + abs_pose（原地写）。
 
     与 MemoryAuthor._backfill_geometry 同一管线（depth_roi 近带聚类 + roi_to_size + roi 中心反投），
@@ -109,6 +176,17 @@ def _backfill_geometry_local(ex, objects, view_pose):
     for (_, o), stats in zip(indexed, stats_list):
         if not stats:
             continue
+        med = stats.get("median_m")
+        # Task 1 ROI 漂移护栏：ROI 中心深度 vs bearing band 距离严重不一致 = ROI 大概率飘到背景地板/远墙
+        #   (经典漂移，见 README 错误①) → 该帧坐标不可信 → 标记丢弃(_roi_drift)，探索走近会重标。
+        band = o.get("distance_m")
+        if (isinstance(med, (int, float)) and med > 0
+                and isinstance(band, (int, float)) and band > 0
+                and abs(med - band) > ROI_DEPTH_MISMATCH_M):
+            o["_roi_drift"] = True
+            o["size_unreliable"] = True
+            o["abs_pose"] = None
+            continue
         sz = dp.roi_to_size(o["roi"], stats)
         # A2 size 清洗：桌面/远物 bbox 越过物体看到远墙 → 尺寸线性虚大。任一维 > 常理家具上限
         #   = depth 打在远面，size 不可信 → 标记并置 null（不瞎编尺寸；abs_pose 保留供去重/召回）。
@@ -118,10 +196,25 @@ def _backfill_geometry_local(ex, objects, view_pose):
             o["size"] = {"width_m": None, "height_m": None, "depth_m": None}
         else:
             o["size"] = sz
-        if stats.get("median_m"):
+        if med:
             try:
                 uc, vc = dp.roi_center_pixel(o["roi"])
-                o["abs_pose"] = dp.back_project(uc, vc, stats["median_m"], robot_pose=pose)["abs_pose"]
+                # Task 1：反投用近带表面深度(near_min_m)而非整框中位，减少 ROI 混入远背景致坐标外推。
+                nmin = stats.get("near_min_m")
+                surf_d = nmin if (isinstance(nmin, (int, float)) and nmin > 0) else med
+                if "distance_m" not in o and isinstance(surf_d, (int, float)) and surf_d > 0:
+                    o["distance_m"] = round(float(surf_d), 3)
+                    o["distance_src"] = "depth_roi"
+                o["abs_pose"] = dp.back_project(uc, vc, surf_d, robot_pose=pose)["abs_pose"]
+                # Task 1(1b) LOS 穿墙反证：观测位姿→abs_pose 线段若中途穿过 occupied 格 = 相机隔墙
+                #   看不到该处 → 反投坐标不可信（幻觉框钉到墙后）→ 标记丢弃（沿用 _roi_drift 风格）。
+                ap = o["abs_pose"]
+                if (occ is not None and isinstance(ap, dict) and ap.get("x") is not None
+                        and not oc.line_free(occ, pose["x"], pose["y"],
+                                             float(ap["x"]), float(ap.get("y") or 0.0))):
+                    o["_los_blocked"] = True
+                    o["size_unreliable"] = True
+                    o["abs_pose"] = None
             except Exception:  # noqa: BLE001
                 pass
 
@@ -154,16 +247,29 @@ PITCH = 1.4              # 格距（米）；覆盖以此为步进向四周铺�
 HINT_CONE_DEG = 30.0    # 顾问提示锥：只在此锥内才算"命中提示方向"
 HINT_BAND_M = 0.75 * PITCH  # 距离量化带：hint 只在同一带内重排，永不跨距离碾压（近优先）
 SWEEP_HEADINGS = (0.0, 90.0, 180.0, 270.0)  # 每个 vantage 原地环视的世界朝向
-NEAR_LABEL_M = 0.5      # 标注铁律：正前 scan 最近障碍必须 > 此值才让 Qwen 标注（太近视角不全→误标→撑爆去重）
+NEAR_LABEL_M = 0.7      # 标注铁律：正前 scan 最近障碍必须 > 此值才让 Qwen 标注（0.5→0.7：太近只剩一块颜色→
+#                         把红柜看成"门"等误标；拉远到 0.7m 视角更全，见阶段十三实测点1）
 BBOX_CLAMP_M = 6.0      # frontier 播种 bbox 钳制半径（坏墙点不至于把 frontier 炸开）
 BBOX_MAX_CELLS = 120    # 播种格数上限保护
 DOOR_CLUSTER_M = 1.2    # 门世界点聚类阈值（去重）
 DOOR_NOMINAL_M = 1.5    # 门世界点估计的名义距离（开口处 scan 常无回波，用名义距离投点供聚类）
 DEDUP_M = 0.6           # 几何校验：同类物体 abs_pose 距离 ≤ 此值=同一物体多视角重复 → 合并；
 #                         更远(如南墙一排矮柜 0.65m+ 间距)=不同实例各自成条（配合 _name_compat 名感知）
+COOCCUR_EPS_M = 0.2     # 单帧共现反合并的"同物阈"：同一帧两个同名框但 abs_pose 差 > 此值=感知已分辨出的
+#                         两个实例(如东排显示器 0.54m) → 禁止被 DEDUP_M 并回去；≤此值=同物双源(YOLO+Qwen)→仍并。
+#                         治"名字对但被同名邻居吃掉"(密集同名家具间距≈坐标噪声, 纯位置去重分不开; 用单帧共现当铁证)
 RELIABLE_Z = (-0.2, 1.6)  # 可信高度带（地面家具）；超出=高处/墙挂物，单帧 depth 反投不可信 → 按名归并并标记
 SANE_MAX_M = 2.5        # A2 尺寸清洗：任一维 > 此值=depth 打到远墙的虚大尺寸 → 标 size_unreliable 并置 null
 BOUNDARY_MARGIN = 0.6   # abs_pose 超出房间边界此余量=depth 打到远墙的错误投影 → 视作不可信
+
+# ===== 标注过滤（Task 3：远距离过报 + 视野过小团在一起 → 不入库；见 Report/qwen_labeling_issue）=====
+FAR_LABEL_M = 2.5       # 距离带门：distance_m > 此值的标注一律丢弃。实测 >2.5m 对率骤降(>3.5m 仅~7%对)；
+#                         远处一团模糊会被 Qwen 报成"桌+显示器+柜"一坨全接地到同一远距离。探索会走近再干净抓。
+MIN_ROI_AREA_FRAC = 0.006  # ROI 归一化面积(w·h, 0~1)下限：小于此=物体在画面里太小/太远 → 视角不全易团 → 丢弃
+MIN_ROI_DIM_FRAC = 0.05    # ROI 最短边(min(w,h), 0~1)下限：细长/极小框同样过滤（团在一起的远物典型）
+# Task 1 ROI 漂移护栏：ROI 中心深度(median_m) 与 bearing band 距离相差 > 此值 = ROI 大概率飘到背景地板/
+#   远墙(经典漂移，见 README 错误①) → 该帧坐标不可信 → 丢弃（探索走近会重标）。
+ROI_DEPTH_MISMATCH_M = 0.8
 
 # ===== Claude 象限调度官（Role-1 覆盖规划；叠加在代码 frontier 兜底之上，绝不替换）=====
 # 角色分工不变：Claude 只读符号地图【选】去哪(从代码筛好的候选里选 id，不产坐标)，代码保证走得成/不漏。
@@ -180,7 +286,7 @@ CAND_PER_QUAD = 3             # 每象限给 Claude 的候选格上限（payload
 REOPEN_FREE_NEIGHBORS = 3     # blocked 格 8 邻里 ≥ 此数是 visited → 疑似假墙，作 reopen 候选
 REOPEN_FRONT_CONE_DEG = 30.0  # 假墙 scan 复核：前向锥半角
 REOPEN_CLEAR_MARGIN = 0.4     # 复核判开：前向最近障碍 ≥ 到目标格距离 + 此余量（匹配 front_block_m）
-OBJECT_STANDOFF_M = 0.5       # 停车铁律：目标格落着物体则只贴近到 ≥ 此距离（太近/太远都看不清）
+OBJECT_STANDOFF_M = 0.7       # 停车铁律：目标格落着物体则只贴近到 ≥ 此距离（0.5→0.7：太近只见一块颜色误标）
 CONSOLIDATE_CLUSTER_M = 0.3   # Role-2 整理：位置聚簇阈值。实测0.3最优：只并近乎重合的同物重复(52→38)、
 #                               召回不掉(60%)；再大(0.6)会把密集区里挨着的不同物体(显示器vs桌)误并、掉召回
 
@@ -204,6 +310,121 @@ def _cell_center(c, pitch=PITCH):
 def _neighbors(c):
     return [(c[0] + dx, c[1] + dy)
             for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1))]
+
+
+# ===== occupancy 覆盖（Q1 修复）：稠密射线建栅格 → frontier 候选 → A* 路由穿缝到远侧 =====
+OCC_RES_M = 0.4          # occupancy 栅格分辨率（比 PITCH 细，够射线标 free + 缝检测）
+CAND_TOTAL = 12          # 给 Claude 的候选总数上限
+LOWCOV_RADIUS_M = 1.2    # 低覆盖判定：已知自由格距任一 visited > 此值 = 观测过没走近
+
+
+def _update_occ(ex, occ, pose):
+    """读一帧 scan_rays 更新 occupancy（射线标 free/occupied + 车格 visited）。失败静默跳过。
+
+    破 Q1 偏置的数据源：稠密射线让被隔断遮挡区一旦从开口扫到就作 free 进栅格、其邻 unknown 成 frontier。
+    """
+    if occ is None:
+        return
+    try:
+        data = json.loads(ex.ros.call("scan_rays", {"max_beams": 180}).text)
+    except Exception:  # noqa: BLE001
+        return
+    beams = data.get("beams")
+    if not beams:
+        return
+    oc.update_from_beams(occ, pose, beams, range_max_m=data.get("range_max_m") or 12.0)
+    oc.mark_visited(occ, pose)
+
+
+def _occ_candidates(occ, visited_cells, blocked_cells, pose, *, cap=CAND_TOTAL):
+    """occupancy frontier + 低覆盖格 → 贴 PITCH 网格的候选（破"只从已扫 bbox 派生"偏置）。
+
+    只保留 A* 从车格【可达】的候选（到不了的先不给 Claude，等扫到更多自由空间再连通）；近优先、去重、限量。
+    返回 [{id, x, y, cell(PITCH), occ_cell, reopen_blocked:False}]（同 _candidate_cells 契约，Claude 只选 id）。
+    """
+    start = occ.cell_of(pose["x"], pose["y"])
+    raw = oc.frontier_cells(occ) | oc.low_coverage_cells(occ, radius_m=LOWCOV_RADIUS_M)
+    best = {}                                    # PITCH 格 -> (dist, occ 格)
+    for c in raw:
+        wx, wy = occ.center(c)
+        pc = _cell(wx, wy)
+        if pc in visited_cells or pc in blocked_cells:
+            continue
+        d = math.hypot(wx - pose["x"], wy - pose["y"])
+        if pc not in best or d < best[pc][0]:
+            best[pc] = (d, c)
+    cands = []
+    for pc, (_d, occ_cell) in sorted(best.items(), key=lambda kv: kv[1][0]):
+        if len(cands) >= cap:
+            break
+        if oc.astar(occ, start, occ_cell) is None:   # 不可达 → 暂不作候选
+            continue
+        cx, cy = _cell_center(pc)
+        cands.append({"id": f"c{len(cands)}", "x": round(cx, 1), "y": round(cy, 1),
+                      "cell": pc, "occ_cell": occ_cell, "reopen_blocked": False})
+    return cands
+
+
+def _quad_visit_counts(visited, bbox):
+    """每象限已访问位姿数（覆盖均衡用）。bbox 空/无 visited → 全 0。"""
+    counts = {"NE": 0, "NW": 0, "SE": 0, "SW": 0}
+    if not bbox or not visited:
+        return counts
+    xmid = (bbox["xmin"] + bbox["xmax"]) / 2.0
+    ymid = (bbox["ymin"] + bbox["ymax"]) / 2.0
+    for v in visited:
+        counts[_quad_of(v[0], v[1], xmid, ymid)] += 1
+    return counts
+
+
+def _least_covered_quad(cands, bbox, visited):
+    """把候选按象限分组，返回(访问最少且有候选的象限, 该象限候选列表)。破 frontier 近邻贪心的方向漂移
+    （治"预算被一个方向吃光、别的区整片漏"的覆盖方差）。无 bbox/候选 → (None, cands)。"""
+    if not cands or not bbox:
+        return None, cands
+    xmid = (bbox["xmin"] + bbox["xmax"]) / 2.0
+    ymid = (bbox["ymin"] + bbox["ymax"]) / 2.0
+    vc = _quad_visit_counts(visited, bbox)
+    by_quad = {}
+    for c in cands:
+        by_quad.setdefault(_quad_of(c["x"], c["y"], xmid, ymid), []).append(c)
+    target_q = min(by_quad.keys(), key=lambda q: (vc.get(q, 0), q))   # 访问最少优先, 名字 tiebreak
+    return target_q, by_quad[target_q]
+
+
+def _balance_filter(cands, bbox, visited):
+    """覆盖均衡硬门：把候选限制在【访问最少的象限】(有候选者)——供 STAGE B 给 Claude 前收窄，
+    让它只能在欠覆盖象限里选 id（代码持有覆盖均衡, Claude 只在允许范围内选）。"""
+    _q, sub = _least_covered_quad(cands, bbox, visited)
+    return sub or cands
+
+
+def _balanced_pick(cands, bbox, visited):
+    """覆盖均衡选点：访问最少象限里离 pose 最近的候选(cands 已近优先排序)。供兜底替代"取最近 frontier"。"""
+    _q, sub = _least_covered_quad(cands, bbox, visited)
+    return sub[0] if sub else (cands[0] if cands else None)
+
+
+def _route_to(ex, occ, target_xy, *, tol_m=0.5, max_legs=14):
+    """occupancy A* → 简化 waypoints → geo_route_around 逐段绕行到 target_xy（门桥接执行）。
+
+    Step 0.2 证：反应式直冲穿不了长墙；A* 在已知自由格上自动生成"绕墙穿缝"走廊路点，再逐段绕行执行。
+    A* 无路(远候选未连通) → 退化 geo_goto_around 直接尽力（下一轮扫到更多自由空间会连通）。返回导航结果 dict。
+    """
+    p = _pose(ex)
+    start = occ.cell_of(p["x"], p["y"])
+    goal = occ.cell_of(target_xy[0], target_xy[1])
+    path = oc.astar(occ, start, goal)
+    if path and len(path) >= 2:
+        wps = oc.path_waypoints(occ, path)
+        if wps:
+            wps[-1] = (round(target_xy[0], 2), round(target_xy[1], 2))   # 末点用精确目标
+            r = nav.geo_route_around(ex, wps, tol_m=tol_m, max_legs=max_legs,
+                                     max_step_m=1.0, front_block_m=0.6, max_stuck=5)
+            r["route_wps"] = wps
+            return r
+    return nav.geo_goto_around(ex, target_xy[0], target_xy[1], tol_m=tol_m,
+                               max_legs=max_legs, max_step_m=1.0, front_block_m=0.6)
 
 
 def _advisor(ex, rep):
@@ -326,16 +547,584 @@ def _ensure_view_distance(ex, min_clear=NEAR_LABEL_M, max_back=3):
     return front
 
 
-def _sweep_vantage(ex, known_names, headings=SWEEP_HEADINGS):
-    """到格后【原地环视】：逐朝向 Qwen inspect（出物体+ROI，本地、免费）+ 顾问标门 + 收墙点；
+def _yoloe_inspect_image(img):
+    """Run the isolated YOLOE environment on one ImagePart and return a report-like dict.
+
+    This intentionally shells out to the `yolo` conda env so explore can keep running in
+    the vLLM/agent_core environment without importing Ultralytics.
+    """
+    if img is None:
+        return {"objects": [], "image": img, "raw": "no image"}
+    frame_dir = os.path.join(YOLOE_TMP_DIR, str(os.getpid()))
+    out_dir = os.path.join(frame_dir, "offline")
+    os.makedirs(frame_dir, exist_ok=True)
+    frame_path = os.path.join(frame_dir, "frame.jpg")
+    with open(frame_path, "wb") as f:
+        f.write(base64.b64decode(img.b64))
+
+    cmd = [
+        YOLOE_PYTHON,
+        os.path.join(HERE, "yolo_offline_probe.py"),
+        "--images",
+        frame_path,
+        "--out",
+        out_dir,
+        "--model",
+        YOLOE_MODEL,
+        "--device",
+        YOLOE_DEVICE,
+        "--conf",
+        str(YOLOE_CONF),
+    ]
+    try:
+        res = subprocess.run(
+            cmd, check=True, capture_output=True, text=True, timeout=YOLOE_TIMEOUT_S
+        )
+        with open(os.path.join(out_dir, "detections.json"), encoding="utf-8") as f:
+            data = json.load(f)
+        images = data.get("images") or []
+        obj0 = images[0] if images else {}
+        objects = obj0.get("objects") or []
+        ann = obj0.get("annotated")            # 画框标注图（相对 out_dir），供审阅实验存档
+        ann_path = os.path.join(out_dir, ann) if ann else None
+        return {"objects": objects, "image": img, "raw": res.stdout, "annotated": ann_path}
+    except Exception as e:  # noqa: BLE001
+        print(f"    [YOLOE失败] {type(e).__name__}: {str(e)[:160]} → 本朝向不记物体")
+        return {"objects": [], "image": img, "raw": str(e), "annotated": None}
+
+
+# ===== 常驻 YOLO 检测服务（模型只加载一次，消除每帧 subprocess+重载）=====
+_YOLO_PROC = [None]      # 惰性单例：Popen 句柄或 None（启动失败/不可用）
+
+
+def _yolo_service():
+    """惰性启动常驻 YOLO 服务（yolo env，模型只加载一次）。返回 Popen 或 None。"""
+    p = _YOLO_PROC[0]
+    if p is not None:
+        return p if p.poll() is None else None
+    os.makedirs(YOLOE_TMP_DIR, exist_ok=True)
+    err_path = os.path.join(YOLOE_TMP_DIR, "service.err")
+    try:
+        errf = open(err_path, "w")   # noqa: SIM115 (进程存活期间需一直打开)
+        p = subprocess.Popen(
+            [YOLOE_PYTHON, os.path.join(HERE, "yolo_service.py"),
+             "--model", YOLOE_MODEL, "--device", YOLOE_DEVICE, "--conf", str(HYBRID_YOLO_CONF)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=errf,
+            text=True, bufsize=1, cwd=HERE)
+        ready = (p.stdout.readline() or "").strip()   # 阻塞等模型加载完（首行 READY）
+        if ready != "READY":
+            print(f"    [YOLO服务] 启动异常(首行={ready!r})，见 {err_path} → 回退每帧 subprocess")
+            _YOLO_PROC[0] = None
+            return None
+        print(f"    [YOLO服务] 就绪（模型已加载，后续每帧免重载）pid={p.pid}")
+        _YOLO_PROC[0] = p
+        return p
+    except Exception as e:  # noqa: BLE001
+        print(f"    [YOLO服务启动失败] {e} → 回退每帧 subprocess")
+        _YOLO_PROC[0] = None
+        return None
+
+
+def _yolo_service_stop():
+    """收尾：优雅关停常驻 YOLO 服务。"""
+    p = _YOLO_PROC[0]
+    if p is None:
+        return
+    try:
+        if p.poll() is None:
+            p.stdin.write("__QUIT__\n")
+            p.stdin.flush()
+            p.wait(timeout=5)
+    except Exception:  # noqa: BLE001
+        try:
+            p.terminate()
+        except Exception:  # noqa: BLE001
+            pass
+    _YOLO_PROC[0] = None
+
+
+def _yolo_detect_raw(img):
+    """跑 YOLO（低 conf）出 raw_detections。优先走常驻服务；不可用则回退单帧 subprocess。
+    返回 (raw_detections, width, height)；失败 → ([], 0, 0)。"""
+    if img is None:
+        return [], 0, 0
+    frame_dir = os.path.join(YOLOE_TMP_DIR, str(os.getpid()))
+    os.makedirs(frame_dir, exist_ok=True)
+    frame_path = os.path.join(frame_dir, "frame.jpg")
+    with open(frame_path, "wb") as f:
+        f.write(base64.b64decode(img.b64))
+    # 首选：常驻服务（一次加载）
+    proc = _yolo_service()
+    if proc is not None:
+        try:
+            proc.stdin.write(frame_path + "\n")
+            proc.stdin.flush()
+            line = proc.stdout.readline()
+            data = json.loads(line) if line else {}
+            if data.get("ok"):
+                return (data.get("raw_detections") or [],
+                        int(data.get("width") or 0), int(data.get("height") or 0))
+            print(f"    [YOLO服务返回错误] {str(data.get('error'))[:120]}")
+        except Exception as e:  # noqa: BLE001
+            print(f"    [YOLO服务调用失败] {type(e).__name__}: {str(e)[:120]} → 本帧回退 subprocess")
+    # 回退：单帧 subprocess（每帧重载，慢但稳）
+    out_dir = os.path.join(frame_dir, "hybrid")
+    cmd = [YOLOE_PYTHON, os.path.join(HERE, "yolo_offline_probe.py"),
+           "--images", frame_path, "--out", out_dir,
+           "--model", YOLOE_MODEL, "--device", YOLOE_DEVICE, "--conf", str(HYBRID_YOLO_CONF)]
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=YOLOE_TIMEOUT_S)
+        with open(os.path.join(out_dir, "detections.json"), encoding="utf-8") as f:
+            data = json.load(f)
+        obj0 = (data.get("images") or [{}])[0]
+        return (obj0.get("raw_detections") or [],
+                int(obj0.get("width") or 0), int(obj0.get("height") or 0))
+    except Exception as e:  # noqa: BLE001
+        print(f"    [混合YOLO失败] {type(e).__name__}: {str(e)[:160]} → 本朝向无框")
+        return [], 0, 0
+
+
+def _hybrid_yolo_boxes(img):
+    """混合后端定位源：YOLO（低 conf）→ raw_detections → 只带 ROI/编号的框（命名交给 Qwen 弃权门）。
+    返回 (boxes, width, height)；失败/无图 → ([], 0, 0)。"""
+    raw, w, h = _yolo_detect_raw(img)
+    boxes = yoloe.raw_detections_to_boxes(raw, w, h, conf_thres=HYBRID_YOLO_CONF)
+    return boxes, w, h
+
+
+def _review_dump(rep, kept, observer_pose, heading, vantage_idx):
+    """审阅实验存档：把本朝向的 YOLO 画框标注图 + 原始检测 + 反投世界坐标(kept)存 YOLOE_REVIEW_DIR。
+
+    产出供人+Claude 审阅 ①YOLO 标的真家具在不在 ②YOLO 有没有在空墙幻觉。YOLOE_REVIEW_DIR 空则跳过。
+    """
+    if not YOLOE_REVIEW_DIR:
+        return
+    img_dir = os.path.join(YOLOE_REVIEW_DIR, "imgs")
+    raw_dir = os.path.join(YOLOE_REVIEW_DIR, "imgs_raw")
+    os.makedirs(img_dir, exist_ok=True)
+    os.makedirs(raw_dir, exist_ok=True)
+    seq = _REVIEW_SEQ[0]
+    _REVIEW_SEQ[0] += 1
+    img_rel = None
+    ann = rep.get("annotated")
+    if ann and os.path.isfile(ann):
+        img_rel = os.path.join("imgs", f"{seq:04d}.jpg")
+        try:
+            shutil.copyfile(ann, os.path.join(YOLOE_REVIEW_DIR, img_rel))
+        except Exception:  # noqa: BLE001
+            img_rel = None
+    # 未标记原图（YOLO 实际看到的帧，无框）——供对比审阅
+    raw_rel = None
+    imgpart = rep.get("image")
+    b64 = getattr(imgpart, "b64", None)
+    if b64:
+        raw_rel = os.path.join("imgs_raw", f"{seq:04d}.jpg")
+        try:
+            with open(os.path.join(YOLOE_REVIEW_DIR, raw_rel), "wb") as rf:
+                rf.write(base64.b64decode(b64))
+        except Exception:  # noqa: BLE001
+            raw_rel = None
+    row = {
+        "seq": seq, "vantage_idx": vantage_idx, "heading": round(float(heading), 1),
+        "observer_pose": {"x": round(observer_pose["x"], 3), "y": round(observer_pose["y"], 3),
+                          "yaw_deg": round(observer_pose.get("yaw_deg", 0.0), 1)},
+        "annotated_image": img_rel,
+        "raw_image": raw_rel,
+        # YOLO 原始检测（画框所示，未过 _annotation_ok）——审阅召回/幻觉的一手证据
+        "yolo_raw": [{"name": o.get("name"), "confidence": o.get("confidence"),
+                      "roi": o.get("roi"), "bbox_center": o.get("bbox_center")}
+                     for o in (rep.get("objects") or []) if isinstance(o, dict)],
+        # 过滤+几何接地后留存物体（带反投世界坐标 abs_pose）——看坐标接地对不对
+        "kept": [{"name": o.get("name"), "confidence": o.get("confidence"),
+                  "roi": o.get("roi"), "abs_pose": o.get("abs_pose")} for o in kept],
+    }
+    with open(os.path.join(YOLOE_REVIEW_DIR, "manifest.jsonl"), "a", encoding="utf-8") as f:
+        f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def _finalize_review(area_path):
+    """审阅实验收尾：拷贝 run 工件 + area.json、跑打分器写 score.txt、生成人读 index.md。
+
+    产出 YOLOE_REVIEW_DIR 一站式证据集：逐朝向标注图 + 反投坐标清单 + 召回打分。YOLOE_REVIEW_DIR 空则跳过。
+    """
+    if not YOLOE_REVIEW_DIR:
+        return
+    try:
+        for src in (RUN_OUT, area_path):
+            if src and os.path.isfile(src):
+                shutil.copyfile(src, os.path.join(YOLOE_REVIEW_DIR, os.path.basename(src)))
+    except Exception as e:  # noqa: BLE001
+        print(f"⚠️ 审阅工件拷贝失败: {e}")
+    # 打分器（纯 stdlib，用当前解释器跑）→ score.txt
+    scorer = os.path.join(HERE, "eval", "score_explore.py")
+    try:
+        res = subprocess.run([sys.executable, scorer], capture_output=True, text=True, timeout=60)
+        with open(os.path.join(YOLOE_REVIEW_DIR, "score.txt"), "w", encoding="utf-8") as f:
+            f.write(res.stdout + ("\n[stderr]\n" + res.stderr if res.stderr else ""))
+    except Exception as e:  # noqa: BLE001
+        print(f"⚠️ 打分器运行失败: {e}")
+    # 人读 index.md：逐朝向 YOLO 原始检测 vs 留存(带坐标)，供审阅召回/幻觉
+    rows = []
+    mpath = os.path.join(YOLOE_REVIEW_DIR, "manifest.jsonl")
+    if os.path.isfile(mpath):
+        with open(mpath, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    rows.append(json.loads(line))
+    n_raw = sum(len(r.get("yolo_raw") or []) for r in rows)
+    n_kept = sum(len(r.get("kept") or []) for r in rows)
+    lines = [f"# YOLO 标注审阅实验（backend={PERCEPTION_BACKEND}, model={YOLOE_MODEL}）", "",
+             f"- 朝向帧数：{len(rows)}  YOLO 原始检测：{n_raw}  过滤+接地留存：{n_kept}",
+             "- 审阅要点：①YOLO 框住的真家具命名对不对（WHAT）②有没有在空墙/虚空画框（幻觉）"
+             "③留存 abs_pose 接地对不对（WHERE）",
+             "- 打分见 `score.txt`；记忆见 `area.json`；轨迹见 `explore_run.json`。", ""]
+    for r in rows:
+        p = r.get("observer_pose") or {}
+        lines.append(f"## 帧{r['seq']:04d} · v{r.get('vantage_idx')} · heading={r.get('heading')}° "
+                     f"· pose=({p.get('x')},{p.get('y')},{p.get('yaw_deg')}°)")
+        if r.get("raw_image"):
+            lines.append(f"原图 ![]({r['raw_image']})")
+        if r.get("annotated_image"):
+            lines.append(f"标注 ![]({r['annotated_image']})")
+        raw = r.get("yolo_raw") or []
+        lines.append(f"- YOLO 原始检测 {len(raw)}：" + (", ".join(
+            f"{o.get('name')}({o.get('confidence')})" for o in raw) or "无"))
+        kept = r.get("kept") or []
+        for o in kept:
+            ap = o.get("abs_pose") or {}
+            lines.append(f"  - 留存 **{o.get('name')}** conf={o.get('confidence')} "
+                         f"abs_pose=({ap.get('x')},{ap.get('y')})")
+        lines.append("")
+    with open(os.path.join(YOLOE_REVIEW_DIR, "index.md"), "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    print(f"[审阅实验] {YOLOE_REVIEW_DIR}  帧={len(rows)} YOLO检测={n_raw} 留存={n_kept}  "
+          f"→ index.md / score.txt / manifest.jsonl")
+
+
+def _obj_brief(o):
+    """物体精简摘要（供审阅清单）：名/置信度/roi。"""
+    return {"name": o.get("name"), "confidence": o.get("confidence"), "roi": o.get("roi")}
+
+
+def _obj_kept_brief(o):
+    """留存物体摘要：名/置信度/反投世界坐标。"""
+    ap = o.get("abs_pose") or {}
+    return {"name": o.get("name"), "confidence": o.get("confidence"),
+            "abs_pose": {"x": ap.get("x"), "y": ap.get("y")} if ap.get("x") is not None else None}
+
+
+def _dual_review_dump(look, rep_q, kept_q, rep_y, kept_y, observer_pose, heading, vantage_idx):
+    """双标注逐帧存档：原图 + Qwen/YOLO 各自【上报物体】与【过滤接地后留存】清单。DUAL_REVIEW_DIR 空则跳过。"""
+    if not DUAL_REVIEW_DIR:
+        return
+    raw_dir = os.path.join(DUAL_REVIEW_DIR, "imgs_raw")
+    os.makedirs(raw_dir, exist_ok=True)
+    seq = _REVIEW_SEQ[0]
+    _REVIEW_SEQ[0] += 1
+    raw_rel = None
+    imgpart = look.images[0] if (look and look.images) else None
+    b64 = getattr(imgpart, "b64", None)
+    if b64:
+        raw_rel = os.path.join("imgs_raw", f"{seq:04d}.jpg")
+        try:
+            with open(os.path.join(DUAL_REVIEW_DIR, raw_rel), "wb") as rf:
+                rf.write(base64.b64decode(b64))
+        except Exception:  # noqa: BLE001
+            raw_rel = None
+    row = {
+        "seq": seq, "vantage_idx": vantage_idx, "heading": round(float(heading), 1),
+        "observer_pose": {"x": round(observer_pose["x"], 3), "y": round(observer_pose["y"], 3),
+                          "yaw_deg": round(observer_pose.get("yaw_deg", 0.0), 1)},
+        "raw_image": raw_rel,
+        # 各标注器【上报的全部物体】（未过滤，看它到底把画面里什么叫成了什么）
+        "qwen_reported": [_obj_brief(o) for o in (rep_q.get("objects") or [])
+                          if isinstance(o, dict)],
+        "yolo_reported": [_obj_brief(o) for o in (rep_y.get("objects") or [])
+                          if isinstance(o, dict)],
+        # 过滤+几何接地后【留存】（进各自记忆图、参与打分）
+        "qwen_kept": [_obj_kept_brief(o) for o in kept_q],
+        "yolo_kept": [_obj_kept_brief(o) for o in kept_y],
+    }
+    with open(os.path.join(DUAL_REVIEW_DIR, "manifest.jsonl"), "a", encoding="utf-8") as f:
+        f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def _finalize_dual(qwen_area_path, yolo_records, bbox, visited, occ, director):
+    """双标注收尾：Qwen 主记忆已写盘；这里由 YOLO 旁路记录另建一张 YOLO 记忆图，两张各自打分并写 index.md。"""
+    if not DUAL_REVIEW_DIR:
+        return
+    scorer = os.path.join(HERE, "eval", "score_explore.py")
+
+    def _score(area_path, tag):
+        try:
+            res = subprocess.run([sys.executable, scorer, area_path], capture_output=True,
+                                 text=True, timeout=60)
+            fp = os.path.join(DUAL_REVIEW_DIR, f"score_{tag}.txt")
+            with open(fp, "w", encoding="utf-8") as f:
+                f.write(res.stdout + ("\n[stderr]\n" + res.stderr if res.stderr else ""))
+            return res.stdout
+        except Exception as e:  # noqa: BLE001
+            print(f"⚠️ 打分器({tag})失败: {e}")
+            return ""
+
+    # Qwen 记忆图（主记忆，正常流程已写）→ 拷贝一份 + 打分
+    try:
+        if qwen_area_path and os.path.isfile(qwen_area_path):
+            shutil.copyfile(qwen_area_path, os.path.join(DUAL_REVIEW_DIR, "area_qwen.json"))
+    except Exception as e:  # noqa: BLE001
+        print(f"⚠️ 拷贝 qwen area 失败: {e}")
+    out_q = _score(qwen_area_path, "qwen")
+    # YOLO 记忆图：同一套后处理（去重 + 反证 + 整理）从 YOLO 旁路记录另建，写独立 json 打分
+    yolo_clean = _dedup_objects(yolo_records, bbox)
+    yolo_clean, _p1 = _free_space_phantoms(yolo_clean, visited)
+    yolo_clean, _p2 = _occupancy_phantoms(yolo_clean, occ)
+    try:
+        yolo_clean = _consolidate_memory(yolo_clean, director)
+    except Exception as e:  # noqa: BLE001
+        print(f"⚠️ YOLO 记忆整理跳过: {e}")
+    yolo_area = os.path.join(DUAL_REVIEW_DIR, "area_yolo.json")
+    with open(yolo_area, "w", encoding="utf-8") as f:
+        json.dump({"area": AREA, "type": "explore", "objects": yolo_clean},
+                  f, ensure_ascii=False, indent=2)
+    out_y = _score(yolo_area, "yolo")
+
+    def _recall(txt):
+        m = re.search(r"召回率 = (\d+)/(\d+)", txt or "")
+        return m.group(0) if m else "n/a"
+    # 画框（Qwen/YOLO 各一套）+ 逐帧三图并列 index.md（best-effort，缺 PIL 不致命）
+    _mp = os.path.join(DUAL_REVIEW_DIR, "manifest.jsonl")
+    n_rows = sum(1 for _ in open(_mp, encoding="utf-8")) if os.path.isfile(_mp) else 0
+    try:
+        import draw_dual_boxes
+        draw_dual_boxes.draw_dual(DUAL_REVIEW_DIR)
+        draw_dual_boxes.write_index(DUAL_REVIEW_DIR)
+    except Exception as e:  # noqa: BLE001
+        print(f"⚠️ 画框/索引生成跳过: {e}")
+    print(f"[双标注对比] {DUAL_REVIEW_DIR}  帧={n_rows}  "
+          f"Qwen召回={_recall(out_q)}  YOLO召回={_recall(out_y)}")
+
+
+def _hybrid_review_dump(look, boxes, judg, kept_h, rep_base, kept_base,
+                        observer_pose, heading, vantage_idx):
+    """混合验证逐帧存档：原图 + 编号框图（Qwen 实际所见）+ 每框 YOLO conf/detector_label 与 Qwen 判定，
+    以及混合留存(带 abs_pose) 与 Qwen-only 基线上报/留存。HYBRID_REVIEW_DIR 空则跳过。"""
+    if not HYBRID_REVIEW_DIR:
+        return
+    for d in ("imgs_raw", "imgs_yolo", "imgs_qwen", "imgs_numbered"):
+        os.makedirs(os.path.join(HYBRID_REVIEW_DIR, d), exist_ok=True)
+    seq = _REVIEW_SEQ[0]
+    _REVIEW_SEQ[0] += 1
+    imgpart = look.images[0] if (look and look.images) else None
+    b64 = getattr(imgpart, "b64", None)
+    raw_rel = yolo_rel = qwen_rel = num_rel = None
+    if b64:
+        raw_rel = os.path.join("imgs_raw", f"{seq:04d}.jpg")
+        try:
+            with open(os.path.join(HYBRID_REVIEW_DIR, raw_rel), "wb") as rf:
+                rf.write(base64.b64decode(b64))
+        except Exception:  # noqa: BLE001
+            raw_rel = None
+        # 三套结果图：①YOLO 标注(橙,所有提议框 label=英类conf) ②Qwen 注入(绿,仅留存框 label=中文名)
+        # ③编号图(蓝,Qwen 判框时实际所见——只给编号不给 YOLO 类名，防 priming)
+        try:
+            import io
+            import draw_dual_boxes
+            from PIL import Image as PILImage
+            src = base64.b64decode(b64)
+            yolo_items = [{"roi": b.get("roi"),
+                           "label": f"{b.get('idx')}:{b.get('detector_label')} "
+                                    f"{b.get('confidence')}"} for b in (boxes or [])]
+            qwen_items = [{"roi": b.get("roi"),
+                           "label": ((judg or {}).get(b.get("idx")) or {}).get("name")}
+                          for b in (boxes or [])
+                          if ((judg or {}).get(b.get("idx")) or {}).get("keep")]
+            for rel, items, color, drawer in (
+                (os.path.join("imgs_yolo", f"{seq:04d}.jpg"), yolo_items,
+                 draw_dual_boxes.YOLO_COLOR, "labeled"),
+                (os.path.join("imgs_qwen", f"{seq:04d}.jpg"), qwen_items,
+                 draw_dual_boxes.QWEN_COLOR, "labeled"),
+                (os.path.join("imgs_numbered", f"{seq:04d}.jpg"), boxes, None, "numbered"),
+            ):
+                base = PILImage.open(io.BytesIO(src))
+                if drawer == "numbered":
+                    ann = draw_dual_boxes.draw_numbered_boxes(base, items)
+                else:
+                    ann = draw_dual_boxes.draw_labeled_boxes(base, items, color=color)
+                ann.save(os.path.join(HYBRID_REVIEW_DIR, rel), quality=90)
+            yolo_rel = os.path.join("imgs_yolo", f"{seq:04d}.jpg")
+            qwen_rel = os.path.join("imgs_qwen", f"{seq:04d}.jpg")
+            num_rel = os.path.join("imgs_numbered", f"{seq:04d}.jpg")
+        except Exception as _e:  # noqa: BLE001
+            print(f"    [混合存图失败] {type(_e).__name__}: {str(_e)[:120]}")
+    row = {
+        "seq": seq, "vantage_idx": vantage_idx, "heading": round(float(heading), 1),
+        "observer_pose": {"x": round(observer_pose["x"], 3), "y": round(observer_pose["y"], 3),
+                          "yaw_deg": round(observer_pose.get("yaw_deg", 0.0), 1)},
+        "raw_image": raw_rel, "yolo_image": yolo_rel, "qwen_image": qwen_rel,
+        "numbered_image": num_rel,
+        # YOLO 低 conf 出的每个框（编号 + conf + 英类 + roi）
+        "yolo_boxes": [{"idx": b.get("idx"), "confidence": b.get("confidence"),
+                        "detector_label": b.get("detector_label"), "roi": b.get("roi")}
+                       for b in (boxes or [])],
+        # Qwen 逐框判定（命名 / 完整度 / 是否留存=弃权门结果）
+        "qwen_judgments": [{"idx": i, "name": j.get("name"),
+                            "completeness": j.get("completeness"), "keep": j.get("keep")}
+                           for i, j in sorted((judg or {}).items())],
+        # 混合过滤+接地后留存（带反投世界坐标）
+        "hybrid_kept": [_obj_kept_brief(o) for o in kept_h],
+        # Qwen-only 基线：同帧上报 + 留存（对照混合召回）
+        "baseline_reported": [_obj_brief(o) for o in (rep_base.get("objects") or [])
+                              if isinstance(o, dict)],
+        "baseline_kept": [_obj_kept_brief(o) for o in kept_base],
+    }
+    with open(os.path.join(HYBRID_REVIEW_DIR, "manifest.jsonl"), "a", encoding="utf-8") as f:
+        f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def _finalize_hybrid_review(hybrid_area_path, baseline_records, bbox, visited, occ, director):
+    """混合验证收尾：混合主记忆已写盘（=area_hybrid）；由 Qwen-only 旁路记录另建基线记忆图，
+    两张各自打分并生成人读 index.md（逐帧 原图|编号框图 + 每框 YOLO/Qwen 判定 + 两路留存）。"""
+    if not HYBRID_REVIEW_DIR:
+        return
+    scorer = os.path.join(HERE, "eval", "score_explore.py")
+
+    def _score(area_path, tag):
+        try:
+            res = subprocess.run([sys.executable, scorer, area_path], capture_output=True,
+                                 text=True, timeout=60)
+            with open(os.path.join(HYBRID_REVIEW_DIR, f"score_{tag}.txt"), "w",
+                      encoding="utf-8") as f:
+                f.write(res.stdout + ("\n[stderr]\n" + res.stderr if res.stderr else ""))
+            return res.stdout
+        except Exception as e:  # noqa: BLE001
+            print(f"⚠️ 打分器({tag})失败: {e}")
+            return ""
+
+    # 混合记忆图（主记忆，正常流程已写）→ 拷贝一份为 area_hybrid.json + 打分
+    try:
+        if hybrid_area_path and os.path.isfile(hybrid_area_path):
+            shutil.copyfile(hybrid_area_path,
+                            os.path.join(HYBRID_REVIEW_DIR, "area_hybrid.json"))
+    except Exception as e:  # noqa: BLE001
+        print(f"⚠️ 拷贝 hybrid area 失败: {e}")
+    out_h = _score(hybrid_area_path, "hybrid")
+    # Qwen-only 基线记忆图：同一套后处理从基线旁路记录另建，写独立 json 打分
+    base_clean = _dedup_objects(baseline_records, bbox)
+    base_clean, _p1 = _free_space_phantoms(base_clean, visited)
+    base_clean, _p2 = _occupancy_phantoms(base_clean, occ)
+    try:
+        base_clean = _consolidate_memory(base_clean, director)
+    except Exception as e:  # noqa: BLE001
+        print(f"⚠️ 基线记忆整理跳过: {e}")
+    base_area = os.path.join(HYBRID_REVIEW_DIR, "area_baseline.json")
+    with open(base_area, "w", encoding="utf-8") as f:
+        json.dump({"area": AREA, "type": "explore", "objects": base_clean},
+                  f, ensure_ascii=False, indent=2)
+    out_b = _score(base_area, "baseline")
+
+    def _recall(txt):
+        m = re.search(r"召回率 = (\d+)/(\d+)", txt or "")
+        return m.group(0) if m else "n/a"
+    _write_hybrid_index(_recall(out_h), _recall(out_b))
+    print(f"[混合弃权门验证] {HYBRID_REVIEW_DIR}  "
+          f"混合召回={_recall(out_h)}  Qwen基线召回={_recall(out_b)}  → index.md 供审阅")
+
+
+def _write_hybrid_index(hybrid_recall, baseline_recall):
+    """人读 index.md：逐帧 原图|编号框图 并列 + 每框 YOLO(conf,label)→Qwen(name/完整度/keep) + 两路留存。"""
+    mpath = os.path.join(HYBRID_REVIEW_DIR, "manifest.jsonl")
+    if not os.path.isfile(mpath):
+        return
+    rows = [json.loads(x) for x in open(mpath, encoding="utf-8") if x.strip()]
+    n_box = sum(len(r.get("yolo_boxes") or []) for r in rows)
+    n_keep = sum(1 for r in rows for j in (r.get("qwen_judgments") or []) if j.get("keep"))
+    lines = [
+        "# 混合标注·弃权门验证实验（YOLO 出 ROI + Qwen 命名/弃权 vs Qwen-only 基线）", "",
+        f"- 帧数：{len(rows)}  YOLO 框总数：{n_box}  Qwen 留存(未弃权)：{n_keep}"
+        f"  弃权率≈{1 - n_keep / n_box:.0%}" if n_box else f"- 帧数：{len(rows)}",
+        f"- **混合记忆召回：{hybrid_recall}**（`score_hybrid.txt`）",
+        f"- **Qwen-only 基线召回：{baseline_recall}**（`score_baseline.txt`）",
+        "- **弃权门通过判据**：对 YOLO 的墙/半截物/空墙框，Qwen `keep=false` 可靠弃权（弃权精度高）；"
+        "且混合召回 ≥ 基线（≥0.70 项目门）。",
+        "- 每帧四图：原图 / YOLO 标注(橙,全部提议) / Qwen 注入(绿,仅留存命名) / 编号图(蓝,Qwen 判框时实际所见)。", ""]
+    for r in rows:
+        p = r.get("observer_pose") or {}
+        seq = r.get("seq")
+        lines.append(f"## 帧{seq:04d} · v{r.get('vantage_idx')} · heading={r.get('heading')}° "
+                     f"· pose=({p.get('x')},{p.get('y')})")
+        quad = []
+        for key, tag in (("raw_image", "原图"), ("yolo_image", "YOLO"),
+                         ("qwen_image", "Qwen"), ("numbered_image", "编号")):
+            if r.get(key):
+                quad.append(f"![{tag}]({r[key]})")
+        lines.append(" ".join(quad))
+        judg = {j.get("idx"): j for j in (r.get("qwen_judgments") or [])}
+        for b in (r.get("yolo_boxes") or []):
+            j = judg.get(b.get("idx")) or {}
+            mark = "✅留存" if j.get("keep") else "🚫弃权"
+            lines.append(
+                f"- 框{b.get('idx')} YOLO({b.get('detector_label')},{b.get('confidence')}) "
+                f"→ Qwen: {j.get('name') or '—'} [{j.get('completeness')}] {mark}")
+        def _hk(o):
+            ap = o.get("abs_pose") or {}
+            return f"{o.get('name')}@({ap.get('x')},{ap.get('y')})"
+        hk = "、".join(_hk(o) for o in (r.get("hybrid_kept") or []))
+        bk = "、".join(o.get("name") for o in (r.get("baseline_reported") or []) if o.get("name"))
+        lines.append(f"- **混合留存**：{hk or '无'}")
+        lines.append(f"- Qwen-only 基线上报：{bk or '无'}")
+        lines.append("")
+    with open(os.path.join(HYBRID_REVIEW_DIR, "index.md"), "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+
+def _process_rep(ex, rep, cur, occ=None):
+    """一次标注(rep.objects) → 过滤(_annotation_ok) + 几何回填(depth_roi→size/abs_pose) +
+    护栏(ROI漂移/LOS穿墙) → 返回留存物体列表。Qwen 与 YOLO 两路共用同一后处理（公平对比）。"""
+    heading_objs = []
+    for o in (rep.get("objects") or []):
+        if not (isinstance(o, dict) and o.get("name")):
+            continue
+        if _is_forbidden_name(o.get("name")):    # 建筑面/门/自身 → 硬过滤，不入物体库
+            print(f"    [丢弃标注] {o.get('name')}: 禁记类(建筑面/门/机器人自身)")
+            continue
+        co = {"name": o["name"], "confidence": o.get("confidence"),
+              "spatial": o.get("bearing"), "roi": o.get("roi"),
+              "bbox_center": o.get("bbox_center"), "distance_m": o.get("distance_m")}
+        ok, why = _annotation_ok(co)
+        if not ok:
+            print(f"    [丢弃标注] {co['name']}: {why}")
+            continue
+        heading_objs.append(co)
+    _backfill_geometry_local(ex, heading_objs, cur, occ=occ)
+    kept = []
+    for o in heading_objs:
+        if o.pop("_roi_drift", False):    # Task 1 护栏：ROI 深度不一致(疑似漂移) → 丢弃该帧
+            print(f"    [丢弃标注] {o.get('name')}: ROI深度与band距离不一致(疑似漂移)")
+            continue
+        if o.pop("_los_blocked", False):  # Task 1(1b)：观测→坐标视线穿墙(疑似钉墙后) → 丢弃该帧
+            print(f"    [丢弃标注] {o.get('name')}: 观测视线穿墙(反投坐标在墙后,疑似幻觉)")
+            continue
+        if o.get("abs_pose") is None:
+            o["abs_pose"] = _qwen_obj_abs_pose(o, cur)
+        kept.append(o)
+    return kept
+
+
+def _sweep_vantage(ex, known_names, headings=SWEEP_HEADINGS, occ=None):
+    """到格后【原地环视】：逐朝向标注器 inspect（出物体+ROI）+ 顾问标门 + 收墙点；
     代码用 depth_roi 给每个物体回填 size+abs_pose（贴物体的框，比 bearing 列距离更准）。
 
-    name_hints=known_names（本区域已记物体名）→ 让 Qwen 沿用同名，减少跨帧命名发散（提升类别召回）。
-    标注前强制正前 scan>NEAR_LABEL_M（太近视角不全易误标、撑爆去重）——退不开的朝向只收墙点不标注。
-    返回 {objects(本 vantage 全部带几何的 Qwen 物体), hint_bearings(世界度), doors_raw, wall_pts}。
+    双标注模式(DUAL_REVIEW_DIR)：同一帧同时给 Qwen 与 YOLO 标注，两路各自后处理并存档对比，
+    Qwen 作驱动（顾问/门/写主记忆），YOLO 旁路收集供对比打分。
+    混合验证模式(HYBRID_REVIEW_DIR)：混合(YOLO ROI+Qwen 命名/弃权)作驱动写主记忆，Qwen-only inspect 旁路作基线。
+    返回 {objects, hint_bearings, doors_raw, wall_pts[, objects_yolo | objects_baseline]}。
     """
-    objs_all, hint_bearings, doors_raw, wall_pts = [], [], [], []
+    objs_all, objs_all_y, hint_bearings, doors_raw, wall_pts = [], [], [], [], []
+    objs_all_base = []
     off_map = {"left": 45.0, "center": 0.0, "right": -45.0}
+    _VANTAGE_SEQ[0] += 1
+    vantage_idx = _VANTAGE_SEQ[0]
     for h in headings:
         p = _pose(ex)
         nav.geo_face_point(ex, p["x"] + math.cos(math.radians(h)), p["y"] + math.sin(math.radians(h)))
@@ -345,8 +1134,30 @@ def _sweep_vantage(ex, known_names, headings=SWEEP_HEADINGS):
         if front is not None and front < NEAR_LABEL_M:
             print(f"    [跳过标注] 正前仅 {front:.2f}m<{NEAR_LABEL_M}m 且退不开 → 本朝向不标注(防近距误标)")
             continue
-        rep = harness.inspect_and_report(ex, name_hints=(sorted(set(known_names)) or None))
-        for hh in _advisor(ex, rep):
+        look = None
+        if DUAL_REVIEW_DIR or HYBRID_REVIEW_DIR or PERCEPTION_BACKEND == "yoloe":
+            look = ex.ros.call("look", {})
+            img = look.images[0] if look.images else None
+        hints = sorted(set(known_names)) or None
+        rep_y = rep_base = None
+        hyb_boxes, hyb_judg = [], {}
+        if DUAL_REVIEW_DIR:                    # Qwen 与 YOLO 看同一帧
+            rep = harness.inspect_and_report(ex, look=look, name_hints=hints)
+            rep_y = _yoloe_inspect_image(img)
+        elif HYBRID_REVIEW_DIR:               # 混合(驱动) vs Qwen-only(基线) 看同一帧
+            hyb_boxes, _w, _h = _hybrid_yolo_boxes(img)
+            hyb_judg = harness.name_boxes(ex, look, hyb_boxes, name_hints=hints)
+            rep_base = harness.inspect_and_report(ex, look=look, name_hints=hints)
+            # 【让 Qwen 全图也看一遍】YOLO 框命名(定位准) ∪ Qwen 全图 inspect(补 YOLO 漏检=召回天花板)
+            #   → 合并交下游按位置/名去重(_dedup_objects)。基线仍单取 rep_base 对照。
+            merged = (yoloe.assemble_hybrid_objects(hyb_boxes, hyb_judg)
+                      + list(rep_base.get("objects") or []))
+            rep = {"objects": merged, "image": img, "raw": ""}
+        elif PERCEPTION_BACKEND == "yoloe":
+            rep = _yoloe_inspect_image(img)
+        else:
+            rep = harness.inspect_and_report(ex, name_hints=hints)
+        for hh in _advisor(ex, rep):           # 导航顾问用驱动标注器(dual=Qwen)
             if not isinstance(hh, dict):
                 continue
             off = off_map.get((hh.get("dir") or "").lower())
@@ -358,21 +1169,109 @@ def _sweep_vantage(ex, known_names, headings=SWEEP_HEADINGS):
                 doors_raw.append({"from": [round(cur["x"], 2), round(cur["y"], 2)],
                                   "bearing": wb, "dir": hh.get("dir"),
                                   "reason": str(hh.get("reason", ""))[:50]})
-        # 收集本朝向 Qwen 物体（带 roi）→ 几何回填 size+abs_pose（无 roi 的退化用 bbox_center+距离反投）
-        heading_objs = []
-        for o in (rep.get("objects") or []):
-            if not (isinstance(o, dict) and o.get("name")):
-                continue
-            heading_objs.append({"name": o["name"], "confidence": o.get("confidence"),
-                                 "spatial": o.get("bearing"), "roi": o.get("roi"),
-                                 "bbox_center": o.get("bbox_center"), "distance_m": o.get("distance_m")})
-        _backfill_geometry_local(ex, heading_objs, cur)
-        for o in heading_objs:
-            if o.get("abs_pose") is None:
-                o["abs_pose"] = _qwen_obj_abs_pose(o, cur)
-        objs_all.extend(heading_objs)
-    return {"objects": objs_all, "hint_bearings": hint_bearings,
-            "doors_raw": doors_raw, "wall_pts": wall_pts}
+        kept = _process_rep(ex, rep, cur, occ)
+        frame_id = f"v{vantage_idx}h{int(h)}"         # 单帧共现反合并的帧身份（vantage+朝向）
+        for _o in kept:
+            _o["_frame"] = frame_id
+        if DUAL_REVIEW_DIR:
+            kept_y = _process_rep(ex, rep_y, cur, occ)
+            _dual_review_dump(look, rep, kept, rep_y, kept_y, cur, h, vantage_idx)
+            for _o in kept_y:
+                _o["_frame"] = frame_id
+            objs_all_y.extend(kept_y)
+        elif HYBRID_REVIEW_DIR:
+            kept_base = _process_rep(ex, rep_base, cur, occ)
+            _hybrid_review_dump(look, hyb_boxes, hyb_judg, kept, rep_base, kept_base,
+                                cur, h, vantage_idx)
+            for _o in kept_base:
+                _o["_frame"] = frame_id
+            objs_all_base.extend(kept_base)
+        elif PERCEPTION_BACKEND == "yoloe":
+            _review_dump(rep, kept, cur, h, vantage_idx)   # 单 YOLO 审阅存档
+        objs_all.extend(kept)
+    ret = {"objects": objs_all, "hint_bearings": hint_bearings,
+           "doors_raw": doors_raw, "wall_pts": wall_pts}
+    if DUAL_REVIEW_DIR:
+        ret["objects_yolo"] = objs_all_y
+    if HYBRID_REVIEW_DIR:
+        ret["objects_baseline"] = objs_all_base
+    return ret
+
+
+# ===== Task 2：APF 势场观测点（Claude 每次选点，保留反应式后退兜底）=====
+VIEWPOINT_ARRIVE_TOL_M = 0.3   # 已在选中的观测点附近此距离内 → 不折腾，直接环视
+OBS_REPICK_TRIES = 2           # 到位后观测点不合格时，回 APF 重选的最大次数
+
+
+def _read_sectors(ex, n=36):
+    """读 scan_summary(细分扇区) → {label: dist_m}；失败返回 {}。"""
+    try:
+        scan = json.loads(ex.ros.call("scan_summary", {"sectors": n}).text) or {}
+        return scan.get("sectors", {}) or {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _pick_viewpoint(ex, director, target_xy=None):
+    """环视前：建 APF 势场 → Claude 从候选选安全站位 → 导过去 → 【到位用真实 scan 复核质量门】。
+
+    质量门 `pf.scan_obs_quality`：最近障 ≥0.5m 且四周均匀(CV≤OBS_CV_MAX)才算合格观测点；不合格则把该点
+    排除、从当前位姿回 APF 重选(至多 OBS_REPICK_TRIES 次)——从源头不停在贴墙/角落/桌底这类坏点。
+    角色分工不变：代码算势场/筛候选/判质量/导航，Claude 只【选 id】不产坐标。无候选/异常/全不合格 →
+    返回 None（调用方就地尽力环视一次，用户选定兜底，不丢覆盖）。返回合格观测点 (x,y) 或 None。
+    """
+    fixed_target = target_xy
+    bad_xys = []                                    # 已判不合格的观测点，重选时按邻近剔除
+    for attempt in range(OBS_REPICK_TRIES + 1):
+        p = _pose(ex)
+        if "x" not in p:
+            return None
+        tgt = fixed_target if fixed_target is not None else (p["x"], p["y"])
+        payload = pf.build_viewpoint_payload(_read_sectors(ex), p, tgt)
+        cands = [c for c in (payload.get("_candidates_full") or [])
+                 if all(math.hypot(c["x"] - bx, c["y"] - by) >= VIEWPOINT_ARRIVE_TOL_M
+                        for bx, by in bad_xys)]
+        if not cands:
+            break
+        plan_in = {"ascii_field": payload["ascii_field"], "target_xy": payload["target_xy"],
+                   "pose": payload["pose"],
+                   "candidates": [{"id": c["id"], "x": c["x"], "y": c["y"],
+                                   "clearance_m": c["clearance_m"], "potential": c["potential"]}
+                                  for c in cands]}
+        plan = director.pick_viewpoint(plan_in)
+        tid = plan.get("target_id") if isinstance(plan, dict) else None
+        chosen = next((c for c in cands if c["id"] == tid), None)
+        if chosen is None:
+            break
+        if math.hypot(chosen["x"] - p["x"], chosen["y"] - p["y"]) >= VIEWPOINT_ARRIVE_TOL_M:
+            nav.geo_goto_around(ex, chosen["x"], chosen["y"],
+                                tol_m=VIEWPOINT_ARRIVE_TOL_M, max_legs=10)
+        q = pf.scan_obs_quality(_read_sectors(ex))     # 到位用真实 scan 复核质量门
+        if q["ok"]:
+            print(f"    [APF观测点] Claude 选 {chosen['id']}@({chosen['x']},{chosen['y']}) "
+                  f"clear={chosen['clearance_m']}m min={q['min_clear_m']} cv={q['cv']} "
+                  f"rationale={str(plan.get('rationale', ''))[:46]}")
+            return (chosen["x"], chosen["y"])
+        cur = _pose(ex)
+        bad_xys.append((cur.get("x", chosen["x"]), cur.get("y", chosen["y"])))
+        tail = (f"→ 回APF重选({attempt + 1}/{OBS_REPICK_TRIES})"
+                if attempt < OBS_REPICK_TRIES else f"→ 重选{OBS_REPICK_TRIES}次用尽")
+        print(f"    [观测点不宜] min={q['min_clear_m']} cv={q['cv']} "
+              f"(阈 {pf.OBS_MIN_CLEAR_M}/{pf.OBS_CV_MAX}) {tail}")
+    print("    [观测点] 无合格观测点 → 就地尽力观测")
+    return None
+
+
+def _goto_and_sweep(ex, director, known_names, target_xy=None, occ=None):
+    """Task 2 包装：APF+Claude 选观测点并导过去 → 更新 occupancy → _sweep_vantage 环视。
+
+    返回 (sweep, final_pose)。final_pose 为选点移动后的真值位姿，供调用方更新 last_vantage_xy / visited。
+    occ 非空则在观测点用 scan_rays 更新栅格（frontier 覆盖的数据源）。
+    """
+    _pick_viewpoint(ex, director, target_xy)
+    _update_occ(ex, occ, _pose(ex))
+    sweep = _sweep_vantage(ex, known_names, occ=occ)
+    return sweep, _pose(ex)
 
 
 # ===== 几何校验去重（用户："据位姿+深度算物体位置，重复就过滤"）=====
@@ -462,14 +1361,23 @@ def _merge_obj_pair(keep, inc):
             keep["distance_m"] = inc["distance_m"]
 
 
-def _dedup_objects(vantage_records, boundary):
-    """几何校验去重：可信物体(在界内+地面高度带)按【世界位置】去重(name-agnostic)；
+# 物体多视角投票门（休眠件，未接入写盘）：可信物体须 ≥ 这么多个【不同 vantage】独立报到才入库。
+# 实测在【单次覆盖】探索下过狠——真家具多只被走到一次，K=2 把召回打到 5%(见 Report/README §4.5)。
+# 故写盘改用零召回代价的 _free_space_phantoms；本门保留供【将来多次重访的密集覆盖模式】按需启用。
+MIN_OBJ_VIEWS = 2
+
+
+def _dedup_objects(vantage_records, boundary, min_views=1, dropped_out=None):
+    """几何校验去重 + 多视角一致性投票：可信物体(在界内+地面高度带)按【世界位置】去重(name-agnostic)；
     不可信物体(无 abs_pose/越界/高处)按【归一化名】归并并标 size_unreliable。
 
     位置重复=同一物体的多视角重复观测 → 合并而非新增（直接解决 71 条噪声里的"同物多记"）。
+    min_views>1 时启用投票：合并后仅被【单一 vantage】支持的可信物体判为孤帧幻觉丢弃（被丢者
+    追加进 dropped_out 供日志）。投票纯几何(比对反投世界坐标)由代码执行——Qwen 只出单帧证词、
+    代码当陪审团（对齐门校验 DOOR_MIN_COUNT）。默认 min_views=1（不投票，供中途覆盖统计取全量）。
     """
     reliable, unreliable = [], {}
-    for rec in vantage_records:
+    for vi, rec in enumerate(vantage_records):     # vi=vantage 序号，即该观测的"独立视角"身份
         for o in rec.get("objects", []):
             if not isinstance(o, dict) or not o.get("name"):
                 continue
@@ -482,12 +1390,22 @@ def _dedup_objects(vantage_records, boundary):
                 for r in reliable:
                     # 同类 + 位置近 = 同一物体的多视角重复 → 合并；不同类即使挨着也各自成条
                     if _abs_dist(ap, r["abs_pose"]) <= DEDUP_M and _name_compat(o, r):
+                        # 单帧共现反合并：同一帧已在此簇报过同名、且位置差 > 同物阈 = 感知已分辨出的
+                        #   另一个实例(密集同名家具) → 不并进 r，跳过继续找/新建条（保住实例数）。
+                        if (o.get("_frame") in r["_frames"]
+                                and _abs_dist(ap, r["abs_pose"]) > COOCCUR_EPS_M):
+                            continue
                         hit = r
                         break
                 if hit:
                     _merge_obj_pair(hit, o)
+                    hit["_views"].add(vi)        # 记下又一个独立视角佐证了此位置
+                    hit["_frames"].add(o.get("_frame"))
                 else:
-                    reliable.append(dict(o))
+                    no = dict(o)
+                    no["_views"] = {vi}
+                    no["_frames"] = {o.get("_frame")}
+                    reliable.append(no)
             else:
                 key = _norm_name(o["name"])
                 oo = dict(o)
@@ -498,6 +1416,16 @@ def _dedup_objects(vantage_records, boundary):
                     _merge_obj_pair(unreliable[key], oo)
                 else:
                     unreliable[key] = oo
+    # 多视角投票：仅单一 vantage 支持的可信物体=孤帧幻觉 → 丢弃（precision-over-recall）
+    voted = []
+    for o in reliable:
+        n_views = len(o.pop("_views", None) or ())    # 顺手剥除内部记账字段(非 schema、勿写盘)
+        o.pop("_frames", None)
+        if n_views >= min_views:
+            voted.append(o)
+        elif dropped_out is not None:
+            dropped_out.append(o)
+    reliable = voted
     # 跨桶去重：同一物体若已有【可信位置】，丢弃它的不可信高视角重复条（按名/别名匹配），避免双计。
     rel_names = set()
     for o in reliable:
@@ -505,7 +1433,80 @@ def _dedup_objects(vantage_records, boundary):
         for a in (o.get("aliases") or []):
             rel_names.add(_norm_name(a))
     unr_final = [o for o in unreliable.values() if _norm_name(o.get("name")) not in rel_names]
-    return reliable + unr_final
+    result = reliable + unr_final
+    for o in result:                     # 剥除内部记账字段(非 schema、勿写盘)
+        o.pop("_frame", None)
+        o.pop("_frames", None)
+    return result
+
+
+FREE_SPACE_R_M = 0.3    # 自由空间反证半径：物体反投坐标落在任一已走过位姿此半径内=车曾占据该处
+# → 车穿不过真家具 → 判近距离幻觉丢弃。取车体半径量级(robomaster 半宽~0.16、含误差留余)——
+# 真物体绝不会落在车实际到达的点上，故【零召回代价】，只删压在自身轨迹上的近距离幻觉。
+
+
+def _free_space_phantoms(objects, visited_poses, radius=FREE_SPACE_R_M):
+    """自由空间反证：把 abs_pose 落在任一已走过位姿 radius 内的物体判为幻觉（车穿不过真家具）。
+
+    独立于多视角冗余的正交信号——用车【自身轨迹认证的自由空间】反证，故不伤召回（真物体不在此）。
+    返回 (kept, dropped)。无坐标或无轨迹时一律保留（无从反证，不误杀）。
+    """
+    if not visited_poses:
+        return list(objects), []
+    kept, dropped = [], []
+    for o in objects:
+        ap = o.get("abs_pose")
+        if not (isinstance(ap, dict) and ap.get("x") is not None):
+            kept.append(o)                       # 无坐标无从反证 → 保留
+            continue
+        ox, oy = float(ap["x"]), float(ap.get("y") or 0.0)
+        in_free = any(math.hypot(ox - vx, oy - vy) <= radius for vx, vy in visited_poses)
+        (dropped if in_free else kept).append(o)
+    return kept, dropped
+
+
+OCC_FREE_CLEAR_M = 0.6   # occ 自由空间反证：abs_pose 落在已扫自由格、且此半径内无 occupied = 空旷地板幻觉
+# → 车雷达已把该处标 free(看到地板)、附近又没有墙/障碍 → 该处不该有家具 → 判幻觉丢。
+# 「附近无 occupied」是精度护栏：贴墙真家具(墙线记 occupied)因此豁免，不误杀（配合 precision-over-recall）。
+
+
+def _occ_free_phantom(occ, x, y, clear_m=OCC_FREE_CLEAR_M):
+    """abs_pose (x,y) 落在 occ 确信自由格(free/visited) 且邻域 clear_m 内无 occupied → 空旷地板幻觉。
+
+    比 _free_space_phantoms 的「细轨迹」反证覆盖面大得多（整片已扫自由空间）。occ 空/坐标在
+    未知或占据格 → 返回 False（无从反证或可能真有家具，不误杀）。纯查表、可脱 ROS 单测。
+    """
+    if occ is None or not occ.cells:
+        return False
+    c = occ.cell_of(x, y)
+    if occ.state(c) not in oc._KNOWN_FREE:       # 未知/占据处不判（可能真有家具/墙）
+        return False
+    rc = max(1, int(math.ceil(clear_m / occ.res)))
+    for dx in range(-rc, rc + 1):
+        for dy in range(-rc, rc + 1):
+            if occ.state((c[0] + dx, c[1] + dy)) == oc.OCCUPIED:
+                return False                     # 邻域有墙/障碍 → 可能贴墙真家具 → 豁免
+    return True
+
+
+def _occupancy_phantoms(objects, occ, clear_m=OCC_FREE_CLEAR_M):
+    """occ 自由空间反证：abs_pose 落在已扫空旷自由格的物体判为幻觉。返回 (kept, dropped)。
+
+    与 _free_space_phantoms 正交（后者只查车轨迹 0.3m 内）；无坐标/occ 空 → 保留（不误杀）。
+    """
+    if occ is None or not occ.cells:
+        return list(objects), []
+    kept, dropped = [], []
+    for o in objects:
+        ap = o.get("abs_pose")
+        if not (isinstance(ap, dict) and ap.get("x") is not None):
+            kept.append(o)
+            continue
+        if _occ_free_phantom(occ, float(ap["x"]), float(ap.get("y") or 0.0), clear_m):
+            dropped.append(o)
+        else:
+            kept.append(o)
+    return kept, dropped
 
 
 # ===== Role-2：代码按位置聚簇 → Claude 只给每簇规范名 → 代码按簇合并（几何归代码、语义归 Claude）=====
@@ -666,6 +1667,10 @@ def _absorb_sweep(sweep, *, wall_points, vantage_records, doors_raw, known_names
     只折叠环视产物(墙点/物体/门/名字)；visited/steps_log 由各调用点按需另记。返回 hint_bearings。"""
     wall_points.extend(sweep["wall_pts"])
     vantage_records.append({"objects": sweep["objects"]})
+    if "objects_yolo" in sweep:                # 双标注：YOLO 旁路记录另存（不进 Qwen 主记忆）
+        _YOLO_RECORDS.append({"objects": sweep["objects_yolo"]})
+    if "objects_baseline" in sweep:            # 混合验证：Qwen-only 基线旁路另存（不进混合主记忆）
+        _BASELINE_RECORDS.append({"objects": sweep["objects_baseline"]})
     doors_raw.extend(sweep["doors_raw"])
     known_names.extend(o.get("name") for o in sweep["objects"] if o.get("name"))
     return sweep["hint_bearings"]
@@ -803,14 +1808,28 @@ def _candidate_cells(bbox, visited_cells, blocked_cells, per_quad=CAND_PER_QUAD)
     return cands
 
 
-def _build_plan_payload(bbox, quad_stats, obj_xy, candidates, last_rejected, round_i, rounds_left):
-    """把符号地图压成 Claude payload（候选剥掉内部 cell 字段，只留 id/quad/x/y/reopen_blocked）。"""
+def _build_plan_payload(bbox, quad_stats, obj_xy, candidates, last_rejected, round_i, rounds_left,
+                        occ_summary=None):
+    """把符号地图压成 Claude payload（候选剥掉内部 cell 字段，只留 id/x/y[/quad]）。
+
+    occ_summary 非空则附 occupancy 覆盖计数（free/occupied/visited/frontier），供 Claude 判覆盖进度。
+    候选来自 occupancy frontier（可能无 quad 键），故 quad/reopen 用 .get 容错。
+    """
     b = {k: round(v, 1) for k, v in bbox.items()} if bbox else {}
     objs = [{"name": n, "x": x, "y": y} for (n, x, y) in obj_xy]
-    cands = [{"id": c["id"], "quad": c["quad"], "x": c["x"], "y": c["y"],
-              "reopen_blocked": c["reopen_blocked"]} for c in candidates]
-    return {"bbox": b, "quadrants": quad_stats, "objects": objs, "candidates": cands,
-            "last_rejected_reopen": last_rejected, "round": round_i, "rounds_left": rounds_left}
+    cands = []
+    for c in candidates:
+        cc = {"id": c["id"], "x": c["x"], "y": c["y"]}
+        if c.get("quad"):
+            cc["quad"] = c["quad"]
+        if c.get("reopen_blocked"):
+            cc["reopen_blocked"] = True
+        cands.append(cc)
+    out = {"bbox": b, "quadrants": quad_stats, "objects": objs, "candidates": cands,
+           "last_rejected_reopen": last_rejected, "round": round_i, "rounds_left": rounds_left}
+    if occ_summary is not None:
+        out["coverage"] = occ_summary
+    return out
 
 
 def _validate_plan_choice(plan, candidates):
@@ -868,27 +1887,113 @@ def _reverify_open(ex, cell):
     return _is_forward_open(sectors, dist_to_cell)
 
 
-def _frontier_backstop(ex, *, visited, wall_points, vantage_records, doors_raw, steps_log,
-                       visited_cells, blocked_cells, known_names,
+COVER_PITCH_M = 1.8     # 均匀覆盖网格格距（bbox 内每格保证一个观测点）。取 1.8：使南墙边缘格离起点 vantage
+#                         > COVER_RADIUS → 不被起点顺带"覆盖"，逼车真的走到南带观测（治南墙漏）。
+COVER_RADIUS_M = 1.0    # 网格格中心此半径内有过 vantage = 该格已覆盖（略 > 半格距，避免相邻格缝隙）
+
+
+def _uncovered_grid_targets(bbox, occ, vantage_xys, blocked_grid):
+    """已知 bbox 内按 COVER_PITCH 均匀铺格中心 → 过滤：占用格 / 已被 vantage 覆盖(COVER_RADIUS 内) /
+    已标 blocked。返回未覆盖格中心 [(x,y)]（均匀覆盖硬保证的目标池；bbox 随环视扩张,新边格自动纳入）。"""
+    if not bbox:
+        return []
+    out = []
+    nx = int((bbox["xmax"] - bbox["xmin"]) / COVER_PITCH_M) + 1
+    ny = int((bbox["ymax"] - bbox["ymin"]) / COVER_PITCH_M) + 1
+    for ix in range(max(1, nx)):
+        x = bbox["xmin"] + COVER_PITCH_M * (ix + 0.5)
+        if x > bbox["xmax"]:
+            continue
+        for iy in range(max(1, ny)):
+            y = bbox["ymin"] + COVER_PITCH_M * (iy + 0.5)
+            if y > bbox["ymax"]:
+                continue
+            if (round(x, 1), round(y, 1)) in blocked_grid:
+                continue
+            if occ.state(occ.cell_of(x, y)) == oc.OCCUPIED:
+                continue
+            if any(math.hypot(x - vx, y - vy) <= COVER_RADIUS_M for vx, vy in vantage_xys):
+                continue
+            out.append((round(x, 2), round(y, 2)))
+    return out
+
+
+def _grid_coverage(ex, *, director, occ, visited, wall_points, vantage_records, doors_raw,
+                   steps_log, visited_cells, blocked_cells, known_names,
+                   nav_steps, vantages, last_vantage_xy, last_pose, vantage_xys):
+    """均匀网格覆盖（代码持有覆盖保证，取代 frontier 密度/Claude 选点）：反复取【最近的未覆盖格】→ 路由过去
+    (A*/反应式) → 柔性环视 → 记 vantage_xys 标该格已覆盖。保证 bbox 内每个可达格都物理走到一个观测点(含南带,
+    治极角落漏/方向漂移)；bbox 随环视扩张 → 新边格自动纳入(兼顾发现)。无可达未覆盖格/预算尽 → 收。"""
+    stop_reason = "nav_cap"
+    blocked_grid = set()
+    stuck = 0
+    last_xy = (last_pose["x"], last_pose["y"])
+    while nav_steps < MAX_NAV_STEPS and vantages < MAX_VANTAGES:
+        pose = _pose(ex)
+        _update_occ(ex, occ, pose)
+        bbox = dp.boundary_from_points(wall_points + visited)
+        targets = _uncovered_grid_targets(bbox, occ, vantage_xys, blocked_grid)
+        if targets:
+            tx, ty = min(targets, key=lambda t: math.hypot(t[0] - pose["x"], t[1] - pose["y"]))
+        else:
+            # 已知 bbox 内网格已覆盖 → 推最近 frontier 扩张 bbox（发现更多房间 → 下轮新边格再纳入均匀覆盖）。
+            # 只有"无未覆盖格 且 无可达 frontier"才算真完成——否则会像 v6 那样一开局就误判全覆盖退出。
+            fcands = _occ_candidates(occ, visited_cells, blocked_cells, pose, cap=CAND_TOTAL)
+            if not fcands:
+                stop_reason = "covered"
+                print("[网格覆盖] 网格全覆盖 且 无可达 frontier → 覆盖完成")
+                break
+            ftgt = _balanced_pick(fcands, dp.boundary_from_points(wall_points + visited), visited)
+            tx, ty = ftgt["x"], ftgt["y"]
+            print(f"[网格覆盖] 已知区网格已满 → 推 frontier({tx:.1f},{ty:.1f}) 扩张 bbox")
+        r = _route_to(ex, occ, (tx, ty), tol_m=0.6, max_legs=DIRECTOR_MAX_LEGS)
+        nav_steps += r.get("n_steps") or len(r.get("steps") or [])
+        cur = r.get("pose") or _pose(ex)
+        last_pose = cur
+        visited.append([round(cur["x"], 2), round(cur["y"], 2)])
+        visited_cells.add(_cell(cur["x"], cur["y"]))
+        near = math.hypot(cur["x"] - tx, cur["y"] - ty) <= COVER_RADIUS_M
+        if near and _min_vantage_spacing_ok(cur, last_vantage_xy) and vantages < MAX_VANTAGES:
+            sw, cur = _goto_and_sweep(ex, director, known_names, target_xy=(tx, ty), occ=occ)
+            last_pose = cur
+            _absorb_sweep(sw, wall_points=wall_points, vantage_records=vantage_records,
+                          doors_raw=doors_raw, known_names=known_names)
+            vantages += 1
+            last_vantage_xy = (cur["x"], cur["y"])
+            # 标【目标格】已覆盖(不只标漂移后的站位)——否则站位退离目标格 >COVER_RADIUS 时该格永不被标覆盖
+            #   → 反复重选同格(v6b bug)。同时标观测站位,顺带覆盖周边格。
+            vantage_xys.append((tx, ty))
+            vantage_xys.append((cur["x"], cur["y"]))
+            print(f"[网格覆盖{vantages}] 格({tx:.1f},{ty:.1f})→观测({cur['x']:.2f},{cur['y']:.2f}) "
+                  f"Qwen记{len(sw['objects'])}物体 nav={nav_steps}")
+            steps_log.append({"step": vantages - 1, "pose": cur,
+                              "qwen_objects": [o.get("name") for o in sw["objects"]]})
+        elif near:
+            vantage_xys.append((tx, ty))               # 已被邻近 vantage 覆盖(间距太近) → 标该格覆盖不重扫
+            vantage_xys.append((cur["x"], cur["y"]))
+        else:
+            blocked_grid.add((round(tx, 1), round(ty, 1)))   # 到不了 → 标 blocked,不再枉试
+            print(f"[网格覆盖] 格({tx:.1f},{ty:.1f}) 到不了({r.get('status')}) → 标 blocked nav={nav_steps}")
+        moved = math.hypot(cur["x"] - last_xy[0], cur["y"] - last_xy[1])
+        last_xy = (cur["x"], cur["y"])
+        stuck = stuck + 1 if moved < 0.15 else 0
+        if stuck >= STUCK_LIMIT:
+            blocked_grid.add((round(tx, 1), round(ty, 1)))   # 卡死 → 放弃当前格换下一个
+            stuck = 0
+    return nav_steps, vantages, stop_reason, last_pose
+
+
+def _frontier_backstop(ex, *, director, occ, visited, wall_points, vantage_records, doors_raw,
+                       steps_log, visited_cells, blocked_cells, known_names,
                        nav_steps, vantages, last_vantage_xy, last_pose):
-    """代码网格 frontier 覆盖回路 —— 覆盖保证【兜底】(recon+director 之后无条件跑，守住 ≥65%)。
-    从当前 bbox 重新播种 frontier(自动排除已 visited/blocked)，跑到覆盖完/上限/卡死。
-    返回 (nav_steps, vantages, stop_reason, last_pose)。逻辑同旧主回路，仅参数化 + 共用 _absorb_sweep。"""
+    """occupancy frontier 覆盖【兜底】(recon+director 之后无条件跑，守住覆盖下限)。
+    每轮：当前观测点环视(更新 occ)→取最近【可达】frontier 候选→A* 路由过去→标 visited/blocked→卡死逃逸。
+    frontier 耗尽=覆盖完成(unknown 边界扫光)。返回 (nav_steps, vantages, stop_reason, last_pose)。"""
     stop_reason = "nav_cap"
     stuck = 0
-    frontier = set()
     cur = last_pose
     last_iter_xy = (last_pose["x"], last_pose["y"])
     while True:
-        if wall_points:
-            frontier |= _seed_frontier_from_bbox(
-                dp.boundary_from_points(wall_points + visited), visited_cells, blocked_cells)
-        frontier -= visited_cells
-        frontier -= blocked_cells
-        if not frontier:
-            stop_reason = "covered"
-            print("[覆盖] 所有可达格已覆盖 → 完成")
-            break
         if vantages >= MAX_VANTAGES:
             stop_reason = "vantage_cap"
             break
@@ -902,12 +2007,13 @@ def _frontier_backstop(ex, *, visited, wall_points, vantage_records, doors_raw, 
         visited_cells.add(_cell(pose["x"], pose["y"]))
 
         if not _min_vantage_spacing_ok(pose, last_vantage_xy):
-            hint_bearings = []
             print(f"  [跳过环视] 距上一 vantage <{MIN_VANTAGE_SPACING_M}m，不重扫")
+            _update_occ(ex, occ, pose)         # 不环视也刷一帧栅格(frontier 需要最新自由空间)
         else:
-            sweep = _sweep_vantage(ex, known_names)
-            hint_bearings = _absorb_sweep(sweep, wall_points=wall_points, vantage_records=vantage_records,
-                                          doors_raw=doors_raw, known_names=known_names)
+            sweep, pose = _goto_and_sweep(ex, director, known_names, occ=occ)
+            last_pose = pose
+            _absorb_sweep(sweep, wall_points=wall_points, vantage_records=vantage_records,
+                          doors_raw=doors_raw, known_names=known_names)
             vantages += 1
             last_vantage_xy = (pose["x"], pose["y"])
             cobjs = [o.get("name") for o in sweep["objects"]]
@@ -916,45 +2022,45 @@ def _frontier_backstop(ex, *, visited, wall_points, vantage_records, doors_raw, 
             steps_log.append({"step": vantages - 1, "pose": pose, "qwen_objects": cobjs,
                               "n_doors": len(sweep["doors_raw"])})
 
-        frontier |= _seed_frontier_from_bbox(
-            dp.boundary_from_points(wall_points + visited), visited_cells, blocked_cells)
-        frontier -= visited_cells
-        frontier -= blocked_cells
-        if not frontier:
+        cands = _occ_candidates(occ, visited_cells, blocked_cells, pose, cap=CAND_TOTAL)
+        if not cands:
             stop_reason = "covered"
+            print("[覆盖] occupancy 无可达 frontier → unknown 边界扫光，覆盖完成")
             break
-        target_cell = _pick_target(frontier, pose, hint_bearings)
-        tx, ty = _cell_center(target_cell)
-        reached, cur, ns = _drive_to(ex, (tx, ty))
-        nav_steps += ns
-        if reached:
-            visited_cells.add(target_cell)
+        # 覆盖均衡：取【访问最少象限】的最近 frontier，而非全局最近（破近邻贪心的方向漂移）
+        bs_bbox = dp.boundary_from_points(wall_points + visited)
+        tgt = _balanced_pick(cands, bs_bbox, visited)
+        tx, ty = tgt["x"], tgt["y"]
+        r = _route_to(ex, occ, (tx, ty), tol_m=0.5, max_legs=DIRECTOR_MAX_LEGS)
+        nav_steps += r.get("n_steps") or len(r.get("steps") or [])
+        cur = r.get("pose") or _pose(ex)
+        if r.get("arrived"):
+            visited_cells.add(tgt["cell"])
             visited_cells.add(_cell(cur["x"], cur["y"]))
-            frontier |= set(_neighbors(target_cell))
-            print(f"  → 格{target_cell}({tx:.1f},{ty:.1f}) 到位 ({cur['x']:.2f},{cur['y']:.2f}) nav={nav_steps}")
+            print(f"  → 格{tgt['cell']}({tx:.1f},{ty:.1f}) 到位 ({cur['x']:.2f},{cur['y']:.2f}) nav={nav_steps}")
         else:
-            blocked_cells.add(target_cell)
-            blocked_cells |= _blocked_cone(frontier, pose, (tx, ty))
-            print(f"  → 格{target_cell}({tx:.1f},{ty:.1f}) 撞墙 → 标 blocked(含共线锥) nav={nav_steps}")
+            blocked_cells.add(tgt["cell"])
+            print(f"  → 格{tgt['cell']}({tx:.1f},{ty:.1f}) 不可达 → 标 blocked nav={nav_steps}")
 
         moved = math.hypot(cur["x"] - last_iter_xy[0], cur["y"] - last_iter_xy[1])
         last_iter_xy = (cur["x"], cur["y"])
         stuck = stuck + 1 if moved < 0.15 else 0
         if stuck >= STUCK_LIMIT:
-            frontier -= visited_cells
-            frontier -= blocked_cells
-            if frontier:
-                far = max(frontier, key=lambda c: math.hypot(
-                    _cell_center(c)[0] - cur["x"], _cell_center(c)[1] - cur["y"]))
-                fx, fy = _cell_center(far)
-                _, cur, ns2 = _drive_to(ex, (fx, fy), max_steps=3)
-                nav_steps += ns2
+            far = _occ_candidates(occ, visited_cells, blocked_cells, cur, cap=CAND_TOTAL)
+            if far:
+                fc = max(far, key=lambda c: math.hypot(c["x"] - cur["x"], c["y"] - cur["y"]))
+                r2 = _route_to(ex, occ, (fc["x"], fc["y"]), tol_m=0.6, max_legs=6)
+                nav_steps += r2.get("n_steps") or len(r2.get("steps") or [])
+                cur = r2.get("pose") or _pose(ex)
                 esc = math.hypot(cur["x"] - last_iter_xy[0], cur["y"] - last_iter_xy[1])
                 last_iter_xy = (cur["x"], cur["y"])
-                print(f"  [脱困] 逃向最远格({fx:.1f},{fy:.1f}) 位移{esc:.2f}m nav={nav_steps}")
+                print(f"  [脱困] 逃向最远 frontier({fc['x']:.1f},{fc['y']:.1f}) 位移{esc:.2f}m nav={nav_steps}")
                 if esc < 0.15:
                     stop_reason = "stuck"
                     break
+            else:
+                stop_reason = "stuck"
+                break
             stuck = 0
     return nav_steps, vantages, stop_reason, last_pose
 
@@ -989,6 +2095,7 @@ def main():
     nav.geo_face_point(ex, START_XY[0] + 1.0, START_XY[1])   # 朝东起手
 
     visited, wall_points, vantage_records, steps_log, doors_raw = [], [], [], [], []
+    vantage_xys = []                # 已观测(vantage)位姿 [(x,y)]——均匀网格覆盖判"该格是否已覆盖"用
     rec_type = "lounge"
     stop_reason = "nav_cap"
 
@@ -999,8 +2106,10 @@ def main():
     nav_steps, vantages = 0, 0
     last_vantage_xy = None          # 上一个实际环视点（间距门槛用）
     known_names = []                # 已记录物体名（作命名锚点喂 Qwen，减少跨帧命名发散）
-    last_rejected_reopen = []       # scan 复核确认过的真墙 [x,y]（反馈 Claude，别再选）
-    director = AnthropicProvider()  # 象限调度官 + 记忆整理官（同一实例）
+    director = AnthropicProvider()  # 观测点选点 + 记忆整理官（同一实例；覆盖改由代码网格保证）
+    occ = oc.OccGrid(res_m=OCC_RES_M)   # occupancy 覆盖栅格（Q1：稠密射线 → frontier 候选 → A* 路由）
+    _YOLO_RECORDS[:] = []           # 双标注 YOLO 旁路记录（每轮重置）
+    _BASELINE_RECORDS[:] = []       # 混合验证 Qwen-only 基线旁路记录（每轮重置）
 
     def _recon_goto_sweep(txp, typ, tag):
         """recon：VFH 开到点 → 记 visited → 满足间距则环视吸收。更新共享计数。"""
@@ -1013,23 +2122,27 @@ def main():
         visited.append([round(cur["x"], 2), round(cur["y"], 2)])
         visited_cells.add(_cell(cur["x"], cur["y"]))
         if _min_vantage_spacing_ok(cur, last_vantage_xy) and vantages < MAX_VANTAGES:
-            sw = _sweep_vantage(ex, known_names)
+            sw, cur = _goto_and_sweep(ex, director, known_names, occ=occ)   # APF 选观测点后 cur 已更新
+            last_pose = cur
             _absorb_sweep(sw, wall_points=wall_points, vantage_records=vantage_records,
                           doors_raw=doors_raw, known_names=known_names)
             vantages += 1
             last_vantage_xy = (cur["x"], cur["y"])
+            vantage_xys.append((cur["x"], cur["y"]))
             print(f"[RECON-{tag}{vantages}] pose=({cur['x']:.2f},{cur['y']:.2f}) Qwen记{len(sw['objects'])}物体")
 
     try:
         # ===== STAGE A · RECON：自举 bbox（起点环视 → 四内缩角 → 中心 360°）=====
         _hr("STAGE A · RECON（起点环视 → 四角 → 中心 360°，自举房间范围）")
-        s0 = _sweep_vantage(ex, known_names)
+        s0, p0 = _goto_and_sweep(ex, director, known_names, occ=occ)   # 起点也先 APF 选观测点
+        last_pose = p0
         _absorb_sweep(s0, wall_points=wall_points, vantage_records=vantage_records,
                       doors_raw=doors_raw, known_names=known_names)
-        visited.append([round(start["x"], 2), round(start["y"], 2)])
+        visited.append([round(p0["x"], 2), round(p0["y"], 2)])
         vantages += 1
-        last_vantage_xy = (start["x"], start["y"])
-        steps_log.append({"step": 0, "phase": "recon_start", "pose": start,
+        last_vantage_xy = (p0["x"], p0["y"])
+        vantage_xys.append((p0["x"], p0["y"]))
+        steps_log.append({"step": 0, "phase": "recon_start", "pose": p0,
                           "qwen_objects": [o.get("name") for o in s0["objects"]]})
 
         prov_bbox = dp.boundary_from_points(wall_points + visited)
@@ -1044,93 +2157,48 @@ def main():
         if rb and nav_steps < DIRECTOR_NAV_BUDGET and vantages < MAX_VANTAGES:
             _recon_goto_sweep((rb["xmin"] + rb["xmax"]) / 2.0, (rb["ymin"] + rb["ymax"]) / 2.0, "中心")
 
-        # ===== STAGE B · CLAUDE 象限调度官（选欠覆盖象限 → 派 Qwen 去补）=====
-        _hr("STAGE B · 象限调度官（Claude 只从代码候选里选 id；scan 复核 + 绕行 VFH 执行）")
-        empty_rounds = 0
-        fail_streak = 0
-        for round_i in range(DIRECTOR_MAX_ROUNDS):
-            if nav_steps >= DIRECTOR_NAV_BUDGET or vantages >= MAX_VANTAGES:
-                print("[调度官] 预算用尽 → 交给 frontier 兜底")
-                break
-            bbox = dp.boundary_from_points(wall_points + visited)
-            obj_xy = _objects_xy(vantage_records, bbox)
-            quad_stats = _quadrant_stats(bbox, visited_cells, blocked_cells, obj_xy)
-            candidates = _candidate_cells(bbox, visited_cells, blocked_cells)
-            if not candidates:
-                print("[调度官] 无候选格（已铺满）→ 交给兜底")
-                break
-            payload = _build_plan_payload(bbox, quad_stats, obj_xy, candidates,
-                                          last_rejected_reopen, round_i, DIRECTOR_MAX_ROUNDS - round_i)
-            plan = director.plan_coverage(payload)
-            if plan.get("done") is True:
-                print(f"[调度官] 判定四象限已足够覆盖(done) rationale={plan.get('rationale', '')}")
-                break
-            tgt = _validate_plan_choice(plan, candidates)
-            if tgt is None:
-                empty_rounds += 1
-                print(f"[调度官] 空/幻觉计划(第{empty_rounds}次) plan={plan}")
-                if empty_rounds >= DIRECTOR_EMPTY_LIMIT:
-                    print("[调度官] 连续空计划 → 提前交给兜底")
-                    break
-                continue
-            empty_rounds = 0
-            cell = tgt["cell"]
-            print(f"[调度官R{round_i}] 选 {tgt['id']}@{tgt['quad']}({tgt['x']},{tgt['y']}) "
-                  f"reopen={tgt['reopen_blocked']} rationale={plan.get('rationale', '')}")
-            # 假墙重开护栏：scan 复核确认真缺口才去；真墙→驳回并反馈
-            if tgt["reopen_blocked"]:
-                if not _reverify_open(ex, cell):
-                    blocked_cells.add(cell)
-                    last_rejected_reopen.append([tgt["x"], tgt["y"]])
-                    print("  [假墙复核] scan 判定真墙 → 驳回，回填 blocked 并反馈 Claude")
-                    continue
-                blocked_cells.discard(cell)
-                print("  [假墙复核] scan 判定有缺口 → 准许重开")
-            tx, ty = _cell_center(cell)
-            fblock, tol = _stop_rule(cell, obj_xy)   # 目标格有物体则停 ≥0.5m
-            # geo_goto_around：撞墙不放弃，反应式绕行（绕红柜经北缺口进东侧办公区），比 geo_goto 直冲强
-            r = nav.geo_goto_around(ex, tx, ty, tol_m=tol, max_legs=DIRECTOR_MAX_LEGS,
-                                    max_step_m=1.0, front_block_m=fblock)
-            nav_steps += len(r.get("steps") or [])
-            cur = r.get("pose") or _pose(ex)
-            last_pose = cur
-            visited.append([round(cur["x"], 2), round(cur["y"], 2)])
-            visited_cells.add(_cell(cur["x"], cur["y"]))
-            if r.get("arrived"):
-                visited_cells.add(cell)
-                fail_streak = 0
-            else:
-                blocked_cells.add(cell)   # 绕行仍到不了 → 标 blocked（兜底不再枉试）
-                fail_streak += 1
-                print(f"  → 未到位({r.get('status')}) → 标 blocked（连续失败{fail_streak}）")
-                if fail_streak >= DIRECTOR_FAIL_LIMIT:
-                    print("[调度官] 连续多目标绕行仍不可达 → 提前交给兜底（保住 backstop 预算）")
-                    break
-            if r.get("arrived") and _min_vantage_spacing_ok(cur, last_vantage_xy) and vantages < MAX_VANTAGES:
-                sw = _sweep_vantage(ex, known_names)
-                _absorb_sweep(sw, wall_points=wall_points, vantage_records=vantage_records,
-                              doors_raw=doors_raw, known_names=known_names)
-                vantages += 1
-                last_vantage_xy = (cur["x"], cur["y"])
-                print(f"  → 到位环视{vantages} pose=({cur['x']:.2f},{cur['y']:.2f}) Qwen记{len(sw['objects'])}物体 nav={nav_steps}")
+        # ===== STAGE B · 均匀网格覆盖（代码持有覆盖保证，取代 frontier 密度/Claude 频域选点）=====
+        _hr("STAGE B · 均匀网格覆盖（bbox 内每格保证一个观测点；含南带，治极角落漏/方向漂移）")
+        nav_steps, vantages, stop_reason, last_pose = _grid_coverage(
+            ex, director=director, occ=occ, visited=visited, wall_points=wall_points,
+            vantage_records=vantage_records, doors_raw=doors_raw, steps_log=steps_log,
+            visited_cells=visited_cells, blocked_cells=blocked_cells, known_names=known_names,
+            nav_steps=nav_steps, vantages=vantages, last_vantage_xy=last_vantage_xy,
+            last_pose=last_pose, vantage_xys=vantage_xys)
 
-        # ===== STAGE C · FRONTIER 兜底（覆盖保证；无条件跑，守住 ≥65%）=====
+        # ===== STAGE C · FRONTIER 兜底（网格覆盖后的薄兜底：扫光残留 frontier，守住覆盖下限）=====
         _hr("STAGE C · frontier 兜底（无条件补全覆盖，用 nav 剩余额度）")
         nav_steps, vantages, stop_reason, last_pose = _frontier_backstop(
-            ex, visited=visited, wall_points=wall_points, vantage_records=vantage_records,
+            ex, director=director, occ=occ, visited=visited, wall_points=wall_points,
+            vantage_records=vantage_records,
             doors_raw=doors_raw, steps_log=steps_log, visited_cells=visited_cells,
             blocked_cells=blocked_cells, known_names=known_names,
             nav_steps=nav_steps, vantages=vantages, last_vantage_xy=last_vantage_xy, last_pose=last_pose)
         ex.ros.call("stop", {})
     finally:
         ex.close()
+        _yolo_service_stop()      # 关停常驻 YOLO 服务（若启用）
 
     # —— 几何校验去重（用户："据位姿+深度算位置，重复就过滤"）：把所有视角的原始观测先收敛 ——
     bbox = dp.boundary_from_points(wall_points + visited)
     doors = _validate_doors(_cluster_doors(doors_raw), bbox)
     raw_count = sum(len(r.get("objects", []) or []) for r in vantage_records)
     clean_objs = _dedup_objects(vantage_records, bbox)
-    print(f"[去重] 原始观测 {raw_count} → 几何校验后 {len(clean_objs)} 物体")
+    # 自由空间反证（治近距离幻觉）：反投坐标落在车已走过位姿的车体半径内=车穿过该处→物理不可能→丢。
+    # 零召回代价（真物体不会落在车走过的点上），只删压在自身轨迹上的近距离幻觉。
+    clean_objs, phantoms = _free_space_phantoms(clean_objs, visited)
+    # occ 自由空间反证（正交扩展）：abs_pose 落在已扫空旷自由格(附近无墙) = 空旷地板幻觉 → 丢。
+    clean_objs, occ_phantoms = _occupancy_phantoms(clean_objs, occ)
+    print(f"[去重] 原始观测 {raw_count} → 几何校验后 {len(clean_objs)} 物体"
+          f"（轨迹反证丢 {len(phantoms)} + occ空旷反证丢 {len(occ_phantoms)}）")
+    for o in phantoms:
+        ap = o.get("abs_pose") or {}
+        print(f"    [丢弃幻觉] {o.get('name')} @({ap.get('x')},{ap.get('y')}) "
+              f"落在车已走过处(物理不可能)")
+    for o in occ_phantoms:
+        ap = o.get("abs_pose") or {}
+        print(f"    [丢弃幻觉] {o.get('name')} @({ap.get('x')},{ap.get('y')}) "
+              f"落在已扫空旷自由格(该处无家具)")
     # —— Role-2：Claude 记忆整理官（同物不同名并组、不同类分开、幻觉剔除；坐标仍由代码聚合）——
     clean_objs = _consolidate_memory(clean_objs, director)
     # —— 落盘（单一并集写路径）：逐物体 upsert_object（数组并集、同名远位=多实例）——
@@ -1178,6 +2246,11 @@ def main():
     print(f"门(聚类去重 {len(doors)})={doors}")
     print(f"记忆物体({len(final_objs)})={final_objs}")
     print(f"[run 工件] {RUN_OUT}  [记忆] {os.path.join(config.MEMORY_ROOT, config.ENV_NAME, AREA, 'area.json')}")
+    _qwen_area = os.path.join(config.MEMORY_ROOT, config.ENV_NAME, AREA, "area.json")
+    _finalize_review(_qwen_area)
+    _finalize_dual(_qwen_area, list(_YOLO_RECORDS), bbox, visited, occ, director)
+    # 混合验证：主记忆(_qwen_area)此模式下即混合记忆 → 作 area_hybrid；基线由旁路另建对照
+    _finalize_hybrid_review(_qwen_area, list(_BASELINE_RECORDS), bbox, visited, occ, director)
     return 0
 
 

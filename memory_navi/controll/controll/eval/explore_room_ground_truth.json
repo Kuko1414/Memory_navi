@@ -2,48 +2,391 @@
   "_note": "探索模式(explore_probe)召回打分用真值。物理世界 = break_room.wbt（explore_room 只是记忆 area 名）。坐标 +x东 +y北/左，米。范围=整个 break_room（机器人经北侧缺口可穿到东侧办公区，全屋一个 area.json）。observable=true 的物体构成召回分母——全屋可被 0.21m 相机可靠辨认的离散家具（起始室 + 东侧办公区桌/显示器/椅）。observable=false（不计分母、记到算加分、不算幻觉）：键盘(太小辨不出)、远东 x>6 的桌/显示器/橙柜(太远)、远处绿植(不可达)。match_names=可接受的记录名/别名（含中英文）；类别错不在 match_names 里 → 判未召回。门槛：observable 召回 ≥ 0.70。",
   "pos_tol_m": 1.0,
   "objects": [
-    {"name": "红柜", "x": 2.62, "y": 0.22, "observable": true,
-     "match_names": ["红柜", "红色柜子", "红柜子", "red_cabinet", "cabinet", "storage_cabinet", "储物柜", "柜子", "柜"], "note": "任务锚点红柜，东边贴 wall(1)"},
-    {"name": "红柜(北)", "x": 1.4, "y": 2.5, "observable": true,
-     "match_names": ["红柜", "红色柜子", "红柜子", "red_cabinet", "cabinet", "storage_cabinet", "储物柜", "柜子", "柜"], "note": "北侧红柜 cabinet(4)"},
-    {"name": "沙发", "x": 1.23, "y": -2.0, "observable": true,
-     "match_names": ["沙发", "sofa", "couch", "长椅"], "note": "米色沙发，起点右侧"},
-    {"name": "绿植", "x": 2.38, "y": -2.15, "observable": true,
-     "match_names": ["绿植", "植物", "盆栽", "绿色植物", "plant", "potted_plant", "tree", "pot_plant"], "note": "起点右前 SE 绿植"},
-    {"name": "厨台", "x": -1.79, "y": -2.25, "observable": true,
-     "match_names": ["厨台", "料理台", "操作台", "台面", "厨房台", "kitchen_counter", "counter", "kitchen"], "note": "西南角厨台"},
-    {"name": "水槽", "x": -2.27, "y": -2.32, "observable": true,
-     "match_names": ["水槽", "洗手池", "洗手台", "sink"], "note": "厨台上水槽，紧邻厨台"},
-    {"name": "柜子(南1)", "x": -0.01, "y": -2.49, "observable": true,
-     "match_names": ["柜子", "柜", "矮柜", "cabinet", "红柜", "red_cabinet", "储物柜", "storage_cabinet"], "note": "南墙红门矮柜"},
-    {"name": "柜子(南2)", "x": -0.66, "y": -2.49, "observable": true,
-     "match_names": ["柜子", "柜", "矮柜", "cabinet", "红柜", "red_cabinet", "储物柜", "storage_cabinet"], "note": "南墙红门矮柜"},
-    {"name": "柜子(南3)", "x": -1.52, "y": -2.5, "observable": true,
-     "match_names": ["柜子", "柜", "矮柜", "cabinet", "储物柜", "storage_cabinet"], "note": "南墙米色矮柜"},
-    {"name": "柜子(南4)", "x": -2.31, "y": -2.5, "observable": true,
-     "match_names": ["柜子", "柜", "矮柜", "cabinet", "储物柜", "storage_cabinet"], "note": "南墙米色矮柜"},
-    {"name": "显示器群(西区)", "type": "region", "x": -2.84, "y": 0.0,
-     "x_range": [-4.2, -2.84], "y_range": [-2.0, 2.15], "region_margin_m": 0.6, "observable": true,
-     "match_names": ["显示器", "屏幕", "显示屏", "monitor", "screen", "display"],
-     "note": "西隔断墙后办公区的 8 台显示器(x=-2.84)，0.76m>0.62m 矮墙 → 上半部越墙可见。整片算 1 个召回点(看到西区显示器即可)；区域匹配(含 0.6m 余量)。"},
-
-    {"name": "办公桌(东)", "x": 3.18, "y": 0.05, "observable": true, "match_names": ["办公桌", "桌子", "桌", "工作台", "desk", "table"], "note": "红柜后办公区，经北缺口可达"},
-    {"name": "办公桌(东)", "x": 3.18, "y": -1.66, "observable": true, "match_names": ["办公桌", "桌子", "桌", "工作台", "desk", "table"]},
-    {"name": "显示器(东)", "x": 2.877, "y": 0.36, "observable": true, "match_names": ["显示器", "屏幕", "显示屏", "monitor", "screen"]},
-    {"name": "显示器(东)", "x": 2.877, "y": -0.18, "observable": true, "match_names": ["显示器", "屏幕", "显示屏", "monitor", "screen"]},
-    {"name": "显示器(东)", "x": 2.877, "y": -1.29, "observable": true, "match_names": ["显示器", "屏幕", "显示屏", "monitor", "screen"]},
-    {"name": "显示器(东)", "x": 2.879, "y": -1.79, "observable": true, "match_names": ["显示器", "屏幕", "显示屏", "monitor", "screen"]},
-    {"name": "办公椅(东)", "x": 4.02, "y": -0.04, "observable": true, "match_names": ["办公椅", "椅子", "椅", "chair", "office_chair"]},
-    {"name": "办公椅(东)", "x": 3.94, "y": -1.53, "observable": true, "match_names": ["办公椅", "椅子", "椅", "chair", "office_chair"]},
-    {"name": "办公椅(东)", "x": 5.36, "y": -1.48, "observable": true, "match_names": ["办公椅", "椅子", "椅", "chair", "office_chair"]},
-    {"name": "键盘(东)", "x": 3.07, "y": 0.1, "observable": false, "match_names": ["键盘", "keyboard"], "note": "太小，0.21m 相机辨不出"},
-    {"name": "键盘(东)", "x": 2.98, "y": -1.53, "observable": false, "match_names": ["键盘", "keyboard"]},
-    {"name": "办公桌(远东)", "x": 6.14, "y": -1.66, "observable": false, "match_names": ["办公桌", "桌子", "desk", "table"]},
-    {"name": "办公桌(远东)", "x": 6.14, "y": 0.05, "observable": false, "match_names": ["办公桌", "桌子", "desk", "table"]},
-    {"name": "显示器(远东)", "x": 6.479, "y": -1.79, "observable": false, "match_names": ["显示器", "屏幕", "monitor", "screen"]},
-    {"name": "显示器(远东)", "x": 6.477, "y": -1.29, "observable": false, "match_names": ["显示器", "屏幕", "monitor", "screen"]},
-    {"name": "橙色高柜", "x": 6.65, "y": -0.7, "observable": false, "match_names": ["橙色高柜", "高柜", "橙色柜", "cabinet", "柜子"]},
-    {"name": "绿植(远东北)", "x": 6.23, "y": 1.42, "observable": false, "match_names": ["绿植", "植物", "盆栽", "plant", "tree"]},
-    {"name": "绿植(远西南)", "x": -5.78, "y": -2.17, "observable": false, "match_names": ["绿植", "植物", "盆栽", "plant", "tree"]}
+    {
+      "name": "红柜",
+      "x": 2.62,
+      "y": 0.22,
+      "observable": true,
+      "match_names": [
+        "红柜",
+        "红色柜子",
+        "红柜子",
+        "red_cabinet",
+        "cabinet",
+        "storage_cabinet",
+        "储物柜",
+        "柜子",
+        "柜"
+      ],
+      "note": "任务锚点红柜，东边贴 wall(1)"
+    },
+    {
+      "name": "红柜(北)",
+      "x": 1.4,
+      "y": 2.5,
+      "observable": true,
+      "match_names": [
+        "红柜",
+        "红色柜子",
+        "红柜子",
+        "red_cabinet",
+        "cabinet",
+        "storage_cabinet",
+        "储物柜",
+        "柜子",
+        "柜"
+      ],
+      "note": "北侧红柜 cabinet(4)"
+    },
+    {
+      "name": "沙发",
+      "x": 1.23,
+      "y": -2.0,
+      "observable": true,
+      "match_names": [
+        "沙发",
+        "sofa",
+        "couch",
+        "长椅"
+      ],
+      "note": "米色沙发，起点右侧"
+    },
+    {
+      "name": "绿植",
+      "x": 2.38,
+      "y": -2.15,
+      "observable": true,
+      "match_names": [
+        "绿植",
+        "植物",
+        "盆栽",
+        "绿色植物",
+        "plant",
+        "potted_plant",
+        "tree",
+        "pot_plant"
+      ],
+      "note": "起点右前 SE 绿植"
+    },
+    {
+      "name": "厨台",
+      "x": -1.79,
+      "y": -2.25,
+      "observable": true,
+      "match_names": [
+        "厨台",
+        "料理台",
+        "操作台",
+        "台面",
+        "厨房台",
+        "kitchen_counter",
+        "counter",
+        "kitchen"
+      ],
+      "note": "西南角厨台"
+    },
+    {
+      "name": "水槽",
+      "x": -2.27,
+      "y": -2.32,
+      "observable": true,
+      "match_names": [
+        "水槽",
+        "洗手池",
+        "洗手台",
+        "sink"
+      ],
+      "note": "厨台上水槽，紧邻厨台"
+    },
+    {
+      "name": "柜子(南1)",
+      "x": -0.01,
+      "y": -2.49,
+      "observable": true,
+      "match_names": [
+        "柜子",
+        "柜",
+        "矮柜",
+        "cabinet",
+        "红柜",
+        "red_cabinet",
+        "储物柜",
+        "storage_cabinet"
+      ],
+      "note": "南墙红门矮柜"
+    },
+    {
+      "name": "柜子(南2)",
+      "x": -0.66,
+      "y": -2.49,
+      "observable": true,
+      "match_names": [
+        "柜子",
+        "柜",
+        "矮柜",
+        "cabinet",
+        "红柜",
+        "red_cabinet",
+        "储物柜",
+        "storage_cabinet"
+      ],
+      "note": "南墙红门矮柜"
+    },
+    {
+      "name": "柜子(南3)",
+      "x": -1.52,
+      "y": -2.5,
+      "observable": true,
+      "match_names": [
+        "柜子",
+        "柜",
+        "矮柜",
+        "cabinet",
+        "储物柜",
+        "storage_cabinet"
+      ],
+      "note": "南墙米色矮柜"
+    },
+    {
+      "name": "柜子(南4)",
+      "x": -2.31,
+      "y": -2.5,
+      "observable": true,
+      "match_names": [
+        "柜子",
+        "柜",
+        "矮柜",
+        "cabinet",
+        "储物柜",
+        "storage_cabinet"
+      ],
+      "note": "南墙米色矮柜"
+    },
+    {
+      "name": "显示器群(西区)",
+      "type": "region",
+      "x": -2.84,
+      "y": 0.0,
+      "x_range": [
+        -4.2,
+        -2.84
+      ],
+      "y_range": [
+        -2.0,
+        2.15
+      ],
+      "region_margin_m": 0.6,
+      "observable": true,
+      "match_names": [
+        "显示器",
+        "屏幕",
+        "显示屏",
+        "monitor",
+        "screen",
+        "display"
+      ],
+      "note": "西隔断墙后办公区的 8 台显示器(x=-2.84)，0.76m>0.62m 矮墙 → 上半部越墙可见。整片算 1 个召回点(看到西区显示器即可)；区域匹配(含 0.6m 余量)。"
+    },
+    {
+      "name": "办公桌(东)",
+      "x": 3.18,
+      "y": 0.05,
+      "observable": true,
+      "match_names": [
+        "办公桌",
+        "桌子",
+        "桌",
+        "工作台",
+        "desk",
+        "table"
+      ],
+      "note": "红柜后办公区，经北缺口可达"
+    },
+    {
+      "name": "办公桌(东)",
+      "x": 3.18,
+      "y": -1.66,
+      "observable": true,
+      "match_names": [
+        "办公桌",
+        "桌子",
+        "桌",
+        "工作台",
+        "desk",
+        "table"
+      ]
+    },
+    {
+      "name": "显示器群(东区)",
+      "type": "region",
+      "x": 2.878,
+      "y": -0.6,
+      "x_range": [
+        2.7,
+        3.05
+      ],
+      "y_range": [
+        -1.9,
+        0.5
+      ],
+      "region_margin_m": 0.6,
+      "observable": true,
+      "match_names": [
+        "显示器",
+        "屏幕",
+        "显示屏",
+        "monitor",
+        "screen",
+        "display"
+      ],
+      "note": "红柜后东办公区一列4台显示器(x≈2.88,y=-1.79~0.36)，相邻0.5~0.54m=亚分辨率(0.13m低相机分不清个数)。整片算1个召回点；区域匹配(含0.6m余量)。取代原4条点物体(2026-07-06,阶段十三)。"
+    },
+    {
+      "name": "办公椅(东)",
+      "x": 4.02,
+      "y": -0.04,
+      "observable": true,
+      "match_names": [
+        "办公椅",
+        "椅子",
+        "椅",
+        "chair",
+        "office_chair"
+      ]
+    },
+    {
+      "name": "办公椅(东)",
+      "x": 3.94,
+      "y": -1.53,
+      "observable": true,
+      "match_names": [
+        "办公椅",
+        "椅子",
+        "椅",
+        "chair",
+        "office_chair"
+      ]
+    },
+    {
+      "name": "办公椅(东)",
+      "x": 5.36,
+      "y": -1.48,
+      "observable": true,
+      "match_names": [
+        "办公椅",
+        "椅子",
+        "椅",
+        "chair",
+        "office_chair"
+      ]
+    },
+    {
+      "name": "键盘(东)",
+      "x": 3.07,
+      "y": 0.1,
+      "observable": false,
+      "match_names": [
+        "键盘",
+        "keyboard"
+      ],
+      "note": "太小，0.21m 相机辨不出"
+    },
+    {
+      "name": "键盘(东)",
+      "x": 2.98,
+      "y": -1.53,
+      "observable": false,
+      "match_names": [
+        "键盘",
+        "keyboard"
+      ]
+    },
+    {
+      "name": "办公桌(远东)",
+      "x": 6.14,
+      "y": -1.66,
+      "observable": false,
+      "match_names": [
+        "办公桌",
+        "桌子",
+        "desk",
+        "table"
+      ]
+    },
+    {
+      "name": "办公桌(远东)",
+      "x": 6.14,
+      "y": 0.05,
+      "observable": false,
+      "match_names": [
+        "办公桌",
+        "桌子",
+        "desk",
+        "table"
+      ]
+    },
+    {
+      "name": "显示器(远东)",
+      "x": 6.479,
+      "y": -1.79,
+      "observable": false,
+      "match_names": [
+        "显示器",
+        "屏幕",
+        "monitor",
+        "screen"
+      ]
+    },
+    {
+      "name": "显示器(远东)",
+      "x": 6.477,
+      "y": -1.29,
+      "observable": false,
+      "match_names": [
+        "显示器",
+        "屏幕",
+        "monitor",
+        "screen"
+      ]
+    },
+    {
+      "name": "橙色高柜",
+      "x": 6.65,
+      "y": -0.7,
+      "observable": false,
+      "match_names": [
+        "橙色高柜",
+        "高柜",
+        "橙色柜",
+        "cabinet",
+        "柜子"
+      ]
+    },
+    {
+      "name": "绿植(远东北)",
+      "x": 6.23,
+      "y": 1.42,
+      "observable": false,
+      "match_names": [
+        "绿植",
+        "植物",
+        "盆栽",
+        "plant",
+        "tree"
+      ]
+    },
+    {
+      "name": "绿植(远西南)",
+      "x": -5.78,
+      "y": -2.17,
+      "observable": false,
+      "match_names": [
+        "绿植",
+        "植物",
+        "盆栽",
+        "plant",
+        "tree"
+      ]
+    }
   ]
 }

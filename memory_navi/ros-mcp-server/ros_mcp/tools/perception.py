@@ -121,6 +121,39 @@ def summarize_scan(
     }
 
 
+def downsample_rays(
+    ranges,
+    angle_min: float,
+    angle_increment: float,
+    range_min: float = 0.0,
+    range_max: float = float("inf"),
+    max_beams: int = 180,
+) -> list:
+    """把一条 LaserScan 的全精度 ranges 下采样成稠密射线束（纯函数，可脱 ROS 单测）。
+
+    与 summarize_scan 不同：**保留逐 beam 的方向+距离**（下采样到 ≤max_beams），供 occupancy
+    沿射线标 free + 缝检测（扇区最近值做不到）。无命中(nan/inf/越界/<range_min)编码为 dist=-1
+    = 该向自由到量程（occupancy 据此把射线全程标 free、不产假墙）。
+
+    返回 [[bearing_deg(机体系,0=前/+左,REP-103), dist_m 或 -1], ...]，按角度顺序、已下采样。
+    """
+    n = len(ranges)
+    if n == 0:
+        return []
+    stride = max(1, int(math.ceil(n / float(max(1, max_beams)))))
+    rmin = max(range_min, 0.01)
+    out = []
+    for i in range(0, n, stride):
+        r = ranges[i]
+        deg = _norm_deg(math.degrees(angle_min + i * angle_increment))
+        if r is None or r != r or r == float("inf") or r < rmin or r > range_max:
+            d = -1.0                      # 无命中 → 自由到量程
+        else:
+            d = round(float(r), 2)
+        out.append([round(deg, 1), d])
+    return out
+
+
 def register_perception_tools(mcp: FastMCP, ws_manager: WebSocketManager) -> None:
     """注册感知摘要工具到 FastMCP 实例（仿 register_topic_tools）。"""
 
@@ -199,6 +232,74 @@ def register_perception_tools(mcp: FastMCP, ws_manager: WebSocketManager) -> Non
                         )
                         summary["topic"] = topic
                         return summary
+                return {"error": f"Timeout waiting for a message from {topic}"}
+            finally:
+                ws_manager.send({"op": "unsubscribe", "topic": topic})
+
+    @mcp.tool(
+        description=(
+            "Get DENSE per-ray LiDAR readings (downsampled) for occupancy/frontier mapping. "
+            "Unlike scan_summary (which returns only per-sector nearest), this keeps each ray's "
+            "bearing+distance so CODE can ray-cast free space and detect gaps/openings between "
+            "walls. Returns {topic, n_beams, range_max_m, beams:[[bearing_deg, dist_m], ...]} where "
+            "bearing_deg is body-frame (0=front, +=left) and dist_m=-1 means no return (free out to "
+            "range_max). Use for building a coverage map, NOT for LLM reasoning (still compact ~180 pairs)."
+        ),
+    )
+    def scan_rays(max_beams: int = 180, timeout: float = 2.0) -> dict:
+        """订阅一次 /<ns>/scan，返回下采样的逐 beam 射线束（供 occupancy 射线标 free + 缝检测）。"""
+        ns = DEFAULT_NAMESPACE
+        topic = f"/{ns}/scan"
+        msg_type = "sensor_msgs/msg/LaserScan"
+        try:
+            max_beams = int(max_beams)
+            if max_beams < 8:
+                return {"error": "max_beams must be an integer >= 8"}
+        except (ValueError, TypeError):
+            return {"error": "max_beams must be an integer"}
+        try:
+            timeout = float(timeout)
+            if timeout <= 0:
+                return {"error": "timeout must be > 0"}
+        except (ValueError, TypeError):
+            return {"error": "timeout must be a number"}
+
+        subscribe_msg = {
+            "op": "subscribe", "topic": topic, "type": msg_type,
+            "queue_length": 1, "throttle_rate": 0,
+        }
+        with ws_manager:
+            send_error = ws_manager.send(subscribe_msg)
+            if send_error:
+                return {"error": f"Failed to subscribe: {send_error}"}
+            end_time = time.time() + timeout
+            try:
+                while time.time() < end_time:
+                    response = ws_manager.receive(timeout=0.5)
+                    if response is None:
+                        continue
+                    msg_data, _ = parse_input(response, False)
+                    if not msg_data:
+                        continue
+                    if msg_data.get("op") == "status" and msg_data.get("level") == "error":
+                        return {"error": f"Rosbridge error: {msg_data.get('msg', 'Unknown error')}"}
+                    if msg_data.get("op") == "publish" and msg_data.get("topic") == topic:
+                        scan = msg_data.get("msg", {})
+                        ranges = scan.get("ranges") or []
+                        if not ranges:
+                            return {"error": f"{topic} produced an empty scan"}
+                        rmax = float(scan.get("range_max", float("inf")))
+                        beams = downsample_rays(
+                            ranges,
+                            angle_min=float(scan.get("angle_min", 0.0)),
+                            angle_increment=float(scan.get("angle_increment", 0.0)),
+                            range_min=float(scan.get("range_min", 0.0)),
+                            range_max=rmax,
+                            max_beams=max_beams,
+                        )
+                        return {"topic": topic, "n_beams": len(beams),
+                                "range_max_m": None if rmax == float("inf") else round(rmax, 2),
+                                "total_points": len(ranges), "beams": beams}
                 return {"error": f"Timeout waiting for a message from {topic}"}
             finally:
                 ws_manager.send({"op": "unsubscribe", "topic": topic})
