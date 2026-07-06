@@ -64,6 +64,10 @@ DUAL_REVIEW_DIR = os.environ.get("DUAL_REVIEW_DIR", "").strip()
 # 供人+Claude 审「弃权门能否可靠弃 YOLO 的墙/半截物/空墙框」。默认空=不影响现有流程。
 HYBRID_REVIEW_DIR = os.environ.get("HYBRID_REVIEW_DIR", "").strip()
 HYBRID_YOLO_CONF = float(os.environ.get("HYBRID_YOLO_CONF", "0.05"))  # 低 conf 多提议保召回，靠弃权门兜假阳
+# 开关（阶段十四定案=默认关）：关掉 ROI 大小/远距离门 + LOS 穿墙反证。实测(v7)关掉后召回 47%→59%、幻觉不升
+# （YOLO ROI 强跟踪 + 深度值过滤 ROI-drift/占用反证 + 语义链接 dedup/consolidate 仍在压幻觉）。这俩预过滤会误杀
+# 贴墙/稍远真家具→默认关；噪声(幻觉/误标)交给下一步【整理层】用上下文清理。设 FILTER_ROI_LOS=1 可恢复旧硬过滤。
+FILTER_ROI_LOS = os.environ.get("FILTER_ROI_LOS", "0").strip().lower() not in ("0", "false", "no", "off")
 _REVIEW_SEQ = [0]             # 全局递增序号（脚本内唯一命名，不用时间/随机）
 _VANTAGE_SEQ = [0]           # 全局递增 vantage 序号（供审阅定位是第几个观测点）
 _YOLO_RECORDS = []          # 双标注模式下 YOLO 旁路的逐 vantage 记录（另建 YOLO 记忆图打分）
@@ -139,6 +143,8 @@ def _annotation_ok(o):
     只用 Qwen 输出 + 代码接地距离(distance_m)，在几何回填【前】过滤：省一次脏 ROI 的深度读，
     也避免远/团物体污染去重。见 Report/qwen_labeling_issue/README.md 对策①。
     """
+    if not FILTER_ROI_LOS:                   # 实验：关掉 ROI 大小/远距离门（对照召回/幻觉）
+        return True, ""
     dist = o.get("distance_m")
     if isinstance(dist, (int, float)) and dist > FAR_LABEL_M:
         return False, f"dist {dist:.2f}m>{FAR_LABEL_M}m(远距离过报)"
@@ -209,10 +215,11 @@ def _backfill_geometry_local(ex, objects, view_pose, occ=None):
                 # Task 1(1b) LOS 穿墙反证：观测位姿→abs_pose 线段若中途穿过 occupied 格 = 相机隔墙
                 #   看不到该处 → 反投坐标不可信（幻觉框钉到墙后）→ 标记丢弃（沿用 _roi_drift 风格）。
                 ap = o["abs_pose"]
-                if (occ is not None and isinstance(ap, dict) and ap.get("x") is not None
+                if (FILTER_ROI_LOS and occ is not None and isinstance(ap, dict)
+                        and ap.get("x") is not None
                         and not oc.line_free(occ, pose["x"], pose["y"],
                                              float(ap["x"]), float(ap.get("y") or 0.0))):
-                    o["_los_blocked"] = True
+                    o["_los_blocked"] = True    # 实验关闭时不做 LOS 穿墙反证
                     o["size_unreliable"] = True
                     o["abs_pose"] = None
             except Exception:  # noqa: BLE001

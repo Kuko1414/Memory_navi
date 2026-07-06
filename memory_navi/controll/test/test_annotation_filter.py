@@ -12,6 +12,9 @@ if PKG not in sys.path:
 
 import explore_probe as ep  # noqa: E402
 
+# _annotation_ok 现在受 FILTER_ROI_LOS 门控（默认关=v7）；本文件测的就是过滤逻辑本身 → 强制打开。
+ep.FILTER_ROI_LOS = True
+
 
 def test_far_object_dropped():
     """distance_m > FAR_LABEL_M → 丢弃(远距离过报)。"""
