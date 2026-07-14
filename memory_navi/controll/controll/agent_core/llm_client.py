@@ -4,11 +4,16 @@ proxy-safe 写法：trust_env=False + proxy=None，
 避免本机代理环境变量干扰到 localhost 的 vLLM 调用。
 """
 import httpx
-from openai import OpenAI
+try:
+    from openai import OpenAI
+except ImportError:  # pragma: no cover - optional outside vLLM/OpenAI runtimes
+    OpenAI = None
 
 
 def make_vllm_client(base_url: str) -> OpenAI:
     """连到 vLLM 的 OpenAI 客户端（api_key 占位，禁用代理）。"""
+    if OpenAI is None:
+        raise RuntimeError("openai package is not installed")
     return OpenAI(
         base_url=base_url,
         api_key="no-key",

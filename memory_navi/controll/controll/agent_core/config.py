@@ -42,8 +42,19 @@ IMG_QUALITY = int(os.environ.get("IMG_QUALITY", "80"))
 
 # ---- 记忆作者（云端大模型）----
 # Anthropic model id；默认 Sonnet 4.6（视觉强、快/省），更高质量可设 claude-opus-4-8。
+DISABLE_CLAUDE = os.environ.get("DISABLE_CLAUDE", "").strip().lower() in ("1", "true", "yes", "on")
 ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
 ANTHROPIC_MAX_TOKENS = int(os.environ.get("ANTHROPIC_MAX_TOKENS", "1500"))
+
+# ---- 记忆整理官（离线整理 pass，文本-only 不读图）----
+# 整理任务重推理，显式用 opus；与逐帧作者(sonnet)分开。
+CURATE_MODEL = os.environ.get("ANTHROPIC_CURATE_MODEL", "claude-opus-4-8")
+CURATE_MAX_TOKENS = int(os.environ.get("ANTHROPIC_CURATE_MAX_TOKENS", "8192"))
+
+# ---- GPT 视觉仲裁（离线评估 / 低频 triage，不替换 Claude/Qwen）----
+OPENAI_ARBITER_MODEL = os.environ.get("OPENAI_ARBITER_MODEL", "gpt-5.5")
+OPENAI_ARBITER_MAX_TOKENS = int(os.environ.get("OPENAI_ARBITER_MAX_TOKENS", "2000"))
+OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "").strip() or None
 
 # ---- 文件系统式 STG 记忆 ----
 MEMORY_ROOT = os.environ.get("MEMORY_ROOT", "/home/kuko/Kuko1414/memory_navi/memory")

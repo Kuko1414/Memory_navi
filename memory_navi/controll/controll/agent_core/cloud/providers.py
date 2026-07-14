@@ -9,9 +9,17 @@ provider.annotate(image: ImagePart, context: dict) -> dict（符合 MEMORY_RECOR
 用 `claude-api` skill 复核最新 API 与 model id。
 """
 import json
+import math
 import re
 
-import anthropic
+try:
+    import anthropic
+except ImportError:  # pragma: no cover - optional for offline GPT review helpers
+    anthropic = None
+try:
+    from openai import OpenAI
+except ImportError:  # pragma: no cover - optional in non-vLLM test envs
+    OpenAI = None
 
 from .. import config
 from ..image_utils import to_anthropic_image_block, to_openai_image_url
@@ -54,6 +62,69 @@ SYSTEM_RECORD_JSON = (
 )
 
 
+BOX_ARBITRATION_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["boxes"],
+    "properties": {
+        "boxes": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["idx", "keep", "name", "roi_ok", "completeness", "reason"],
+                "properties": {
+                    "idx": {"type": "integer"},
+                    "keep": {"type": "boolean"},
+                    "name": {"type": ["string", "null"]},
+                    "roi_ok": {"type": "boolean"},
+                    "completeness": {"type": "string", "enum": ["完整", "部分", "勉强"]},
+                    "reason": {"type": "string"},
+                },
+            },
+        },
+    },
+}
+
+BOX_ARBITRATION_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "box_arbitration",
+        "strict": True,
+        "schema": BOX_ARBITRATION_SCHEMA,
+    },
+}
+
+TARGET_CONFIRM_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["seen", "confidence", "reason"],
+    "properties": {
+        "seen": {"type": "boolean"},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "reason": {"type": "string"},
+    },
+}
+
+TARGET_CONFIRM_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "target_confirmation",
+        "strict": True,
+        "schema": TARGET_CONFIRM_SCHEMA,
+    },
+}
+
+SYSTEM_BOX_ARBITER = (
+    "你是室内机器人视觉标注仲裁员。图像里已经画好带编号的蓝框；你只裁决这些编号框。"
+    "不要新增框、移动框、输出坐标或距离。每个框输出 keep/name/roi_ok/completeness/reason。"
+    "只有框住的是完整、清晰、独立的家具/设备/可移动物体时 keep=true。"
+    "墙/地板/天花板/踢脚线/梁/门/通道/机器人自身/只是一块平面/半截物/远处糊成一团都 keep=false。"
+    "命名用规范中文通用单数名：沙发/显示器/办公桌/办公椅/柜子/绿植/厨台/水槽/键盘/吊灯等。"
+    "若不确定，宁可 keep=false。只输出符合 schema 的 JSON。"
+)
+
+
 def _build_prompt(context: dict) -> str:
     area = context.get("area_hint") or "未知"
     trigger = context.get("trigger") or "manual"
@@ -80,10 +151,330 @@ def _build_prompt(context: dict) -> str:
     return "\n".join(lines)
 
 
+def _parse_box_judgments_obj(obj: dict, box_ids: list) -> dict:
+    """Normalize box-arbitration JSON into {idx: judgment}; missing ids abstain."""
+    items = obj.get("boxes", []) if isinstance(obj, dict) else []
+    parsed = {}
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        try:
+            idx = int(it.get("idx"))
+        except (TypeError, ValueError):
+            continue
+        comp = it.get("completeness")
+        comp = comp if comp in ("完整", "部分", "勉强") else "部分"
+        name = it.get("name")
+        name = str(name).strip() if isinstance(name, str) and name.strip() else None
+        roi_ok = bool(it.get("roi_ok"))
+        keep = bool(it.get("keep")) and roi_ok and comp == "完整" and name is not None
+        parsed[idx] = {
+            "name": name if keep else None,
+            "completeness": comp,
+            "keep": keep,
+            "roi_ok": roi_ok,
+            "reason": str(it.get("reason") or "")[:120],
+        }
+    for bid in box_ids or []:
+        parsed.setdefault(int(bid), {
+            "name": None,
+            "completeness": "部分",
+            "keep": False,
+            "roi_ok": False,
+            "reason": "missing judgment",
+        })
+    return parsed
+
+
+def parse_openai_box_judgments(raw: str | dict, box_ids: list) -> dict:
+    """Parse GPT box arbitration output; kept boxes must be complete, named, and roi_ok."""
+    if isinstance(raw, dict):
+        return _parse_box_judgments_obj(raw, box_ids)
+    obj = _extract_json(raw or "")
+    return _parse_box_judgments_obj(obj, box_ids)
+
+
+def parse_target_confirmation(raw: str | dict) -> dict:
+    """Parse GPT target confirmation output into {seen, confidence, reason}."""
+    obj = raw if isinstance(raw, dict) else _extract_json(raw or "")
+    if not isinstance(obj, dict):
+        return {"seen": False, "confidence": 0.0, "reason": "invalid output"}
+    try:
+        conf = float(obj.get("confidence", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        conf = 0.0
+    return {
+        "seen": bool(obj.get("seen")),
+        "confidence": max(0.0, min(1.0, conf)),
+        "reason": str(obj.get("reason") or "")[:160],
+    }
+
+
+class OpenAIProvider:
+    """GPT visual arbitrator for YOLO ROI + Qwen naming experiments.
+
+    This provider is intentionally narrow: it judges numbered image boxes and
+    returns schema-bound labels/abstentions. It does not plan routes, alter
+    coordinates, or replace Claude's text-only director/curator roles.
+    """
+
+    def __init__(self, model: str = None, api_key: str = None,
+                 base_url: str = None, max_tokens: int = None):
+        if OpenAI is None:
+            raise RuntimeError("openai package is not installed")
+        kwargs = {}
+        if api_key:
+            kwargs["api_key"] = api_key
+        if base_url or config.OPENAI_BASE_URL:
+            kwargs["base_url"] = base_url or config.OPENAI_BASE_URL
+        self._client = OpenAI(**kwargs)
+        self._model = model or config.OPENAI_ARBITER_MODEL
+        self._max_tokens = max_tokens or config.OPENAI_ARBITER_MAX_TOKENS
+
+    def judge_boxes(self, image, boxes: list, *, qwen_judgments: dict = None,
+                    name_hints: list = None, context: str = "") -> dict:
+        """Judge numbered boxes in an image and return {idx: judgment}.
+
+        image must be an ImagePart, normally the numbered-box image already
+        produced by draw_dual_boxes. Coordinates remain owned by depth/TF code.
+        """
+        box_ids = [int(b.get("idx")) for b in (boxes or []) if b.get("idx") is not None]
+        if not box_ids:
+            return {}
+        user = _build_box_arbitration_prompt(
+            boxes, qwen_judgments=qwen_judgments, name_hints=name_hints, context=context)
+        content = [{"type": "text", "text": user}, to_openai_image_url(image)]
+        try:
+            resp = self._client.chat.completions.create(
+                model=self._model,
+                messages=[
+                    {"role": "system", "content": SYSTEM_BOX_ARBITER},
+                    {"role": "user", "content": content},
+                ],
+                temperature=0,
+                max_tokens=self._max_tokens,
+                response_format=BOX_ARBITRATION_RESPONSE_FORMAT,
+                stream=False,
+            )
+        except TypeError:
+            resp = self._client.chat.completions.create(
+                model=self._model,
+                messages=[
+                    {"role": "system", "content": SYSTEM_BOX_ARBITER},
+                    {"role": "user", "content": content},
+                ],
+                temperature=0,
+                max_tokens=self._max_tokens,
+                stream=False,
+            )
+        raw = resp.choices[0].message.content or ""
+        return parse_openai_box_judgments(raw, box_ids)
+
+    def confirm_target(self, image, target_name: str, *, context: str = "") -> dict:
+        """Low-frequency visual confirmation for ARRIVED_NO_TARGET cases."""
+        user = (
+            f"目标物体：{target_name}\n"
+            "请只判断这张当前相机图里是否能清楚看到目标物体。"
+            "不要猜测画外/记忆里的目标；看不清就 seen=false。\n"
+            f"上下文：{context[:800] if context else '无'}"
+        )
+        content = [{"type": "text", "text": user}, to_openai_image_url(image)]
+        try:
+            resp = self._client.chat.completions.create(
+                model=self._model,
+                messages=[
+                    {"role": "system", "content": "你是机器人到位后的目标可见性复核员，只输出 JSON。"},
+                    {"role": "user", "content": content},
+                ],
+                temperature=0,
+                max_tokens=300,
+                response_format=TARGET_CONFIRM_RESPONSE_FORMAT,
+                stream=False,
+            )
+        except TypeError:
+            resp = self._client.chat.completions.create(
+                model=self._model,
+                messages=[
+                    {"role": "system", "content": "你是机器人到位后的目标可见性复核员，只输出 JSON。"},
+                    {"role": "user", "content": content},
+                ],
+                temperature=0,
+                max_tokens=300,
+                stream=False,
+            )
+        return parse_target_confirmation(resp.choices[0].message.content or "")
+
+
+def _build_box_arbitration_prompt(boxes: list, *, qwen_judgments: dict = None,
+                                  name_hints: list = None, context: str = "") -> str:
+    rows = []
+    for b in boxes or []:
+        idx = b.get("idx")
+        qj = (qwen_judgments or {}).get(idx) or (qwen_judgments or {}).get(str(idx)) or {}
+        rows.append({
+            "idx": idx,
+            "detector_label": b.get("detector_label"),
+            "detector_confidence": b.get("confidence"),
+            "qwen": {
+                "keep": qj.get("keep"),
+                "name": qj.get("name"),
+                "completeness": qj.get("completeness"),
+            } if qj else None,
+        })
+    lines = [
+        "请裁决图中这些蓝框编号。只判断给出的 idx，不要新增框或坐标。",
+        "候选框元数据:",
+        json.dumps(rows, ensure_ascii=False),
+    ]
+    if name_hints:
+        lines.append("本区域常见/已知名称，可沿用但不要被其诱导: " + "、".join(map(str, name_hints[:40])))
+    if context:
+        lines.append("上下文: " + str(context)[:1000])
+    lines.append("每个 idx 都必须输出；看不清、框不准、非家具设备、门/墙/地板/机器人自身均 keep=false。")
+    return "\n".join(lines)
+
+
+class OfflineDirector:
+    """Deterministic fallback for Claude quota outages.
+
+    It keeps the same narrow interfaces used by explore/semantic_route:
+    choose one candidate id, skip optional semantic consolidation, and produce a
+    conservative landmark route from the already-curated map. It never calls a
+    cloud model and never emits coordinates for route legs.
+    """
+
+    def plan_coverage(self, payload: dict) -> dict:
+        cands = payload.get("candidates") or []
+        if not cands:
+            return {"done": True, "target_id": None, "rationale": "offline: no candidates"}
+        return {"done": False, "target_id": cands[0].get("id"), "rationale": "offline: first reachable frontier"}
+
+    def pick_viewpoint(self, payload: dict) -> dict:
+        cands = payload.get("candidates") or []
+        if not cands:
+            return {"target_id": None, "rationale": "offline: no candidates"}
+        chosen = min(cands, key=lambda c: (
+            float(c.get("potential", 0.0) or 0.0),
+            -float(c.get("clearance_m", 0.0) or 0.0),
+        ))
+        return {"target_id": chosen.get("id"), "rationale": "offline: min potential + max clearance"}
+
+    def consolidate_memory(self, records: list) -> dict:
+        return {}
+
+    def curate_area(self, payload: dict) -> dict:
+        return {}
+
+    def plan_route(self, payload: dict) -> dict:
+        return _offline_route_plan(payload)
+
+
+def make_director(model: str = None):
+    """Return AnthropicProvider unless Claude is disabled/unavailable."""
+    disabled = bool(getattr(config, "DISABLE_CLAUDE", False))
+    # Keep env compatibility without adding another config constant to older callers.
+    import os
+    disabled = disabled or os.environ.get("DISABLE_CLAUDE", "").lower() in ("1", "true", "yes", "on")
+    disabled = disabled or os.environ.get("CLOUD_DIRECTOR", "").lower() in ("offline", "none", "local")
+    has_key = bool(os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN"))
+    if disabled or not has_key:
+        print("[云端规划] Claude disabled/unavailable → using OfflineDirector")
+        return OfflineDirector()
+    try:
+        return AnthropicProvider(model=model) if model else AnthropicProvider()
+    except Exception as e:  # noqa: BLE001
+        print(f"[云端规划] AnthropicProvider unavailable({type(e).__name__}: {str(e)[:80]}) → OfflineDirector")
+        return OfflineDirector()
+
+
+def _offline_route_plan(payload: dict) -> dict:
+    target_text = str(payload.get("target") or "")
+    start = payload.get("start_pose") or {}
+    sx, sy = float(start.get("x", 0.0) or 0.0), float(start.get("y", 0.0) or 0.0)
+    landmarks = [lm for lm in (payload.get("landmarks") or []) if lm.get("name")]
+    sub_areas = [sa for sa in (payload.get("sub_areas") or []) if sa.get("label")]
+
+    target_landmarks = [lm for lm in landmarks if str(lm.get("name")) in target_text]
+    target_lm = None
+    if target_landmarks:
+        if "最东" in target_text or "东" in target_text:
+            target_lm = max(target_landmarks, key=lambda lm: float(lm.get("x", sx) or sx))
+        elif "最西" in target_text or "西" in target_text:
+            target_lm = min(target_landmarks, key=lambda lm: float(lm.get("x", sx) or sx))
+        else:
+            target_lm = min(target_landmarks, key=lambda lm: math.hypot(
+                float(lm.get("x", sx) or sx) - sx, float(lm.get("y", sy) or sy) - sy))
+    tx = float((target_lm or {}).get("x", sx) or sx)
+
+    legs = []
+    named_target_areas = [sa for sa in sub_areas if str(sa.get("label")) in target_text]
+    target_area = named_target_areas[0] if named_target_areas else None
+    target_label = target_area.get("label") if target_area else None
+
+    bridges = []
+    for sa in sub_areas:
+        label = sa.get("label")
+        center = sa.get("center") or {}
+        if not label or label == target_label or center.get("x") is None:
+            continue
+        x = float(center.get("x"))
+        if (sx <= x <= tx) or (tx <= x <= sx):
+            bridges.append(sa)
+    bridges.sort(key=lambda sa: abs(float((sa.get("center") or {}).get("x", sx)) - sx))
+    for sa in bridges[:2]:
+        legs.append({"via": sa["label"], "manner": "at", "note": "offline中转子区"})
+
+    # 门到门：目标跨隔断时，插一条"最近门"桥接（沿 start→target 的 x 跨度选带 label 的门，确定性）。
+    span_doors = []
+    for d in (payload.get("doors") or []):
+        pose = d.get("pose") or {}
+        label = d.get("label") or d.get("id")
+        dx = pose.get("x")
+        if not label or dx is None:
+            continue
+        if (sx <= float(dx) <= tx) or (tx <= float(dx) <= sx):
+            span_doors.append((abs(float(dx) - sx), label))
+    if span_doors:
+        span_doors.sort()
+        legs.append({"via": span_doors[0][1], "manner": "at", "note": "offline穿隔断开口"})
+
+    if target_label:
+        legs.append({"via": target_label, "manner": "at", "note": "offline进入目标子区"})
+
+    if target_lm:
+        if "左" in target_text or "left" in target_text.lower():
+            manner = "left"
+        elif "右" in target_text or "right" in target_text.lower():
+            manner = "right"
+        elif "后" in target_text or "behind" in target_text.lower():
+            manner = "behind"
+        else:
+            manner = "near"
+        legs.append({"via": target_lm["name"], "manner": manner, "note": "offline目标收尾"})
+
+    if not legs and landmarks:
+        nearest = min(landmarks, key=lambda lm: math.hypot(
+            float(lm.get("x", sx) or sx) - sx, float(lm.get("y", sy) or sy) - sy))
+        legs.append({"via": nearest["name"], "manner": "near", "note": "offline最近地标兜底"})
+
+    # Deduplicate adjacent equal via/manner pairs while preserving order.
+    deduped = []
+    seen = set()
+    for leg in legs:
+        key = (leg.get("via"), leg.get("manner"))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(leg)
+    return {"legs": deduped, "goal_note": "offline deterministic route"}
+
+
 class AnthropicProvider:
     """Claude 记忆作者（主）。"""
 
     def __init__(self, model: str = None, api_key: str = None, max_tokens: int = None):
+        if anthropic is None:
+            raise RuntimeError("anthropic package is not installed")
         self._client = anthropic.Anthropic(api_key=api_key) if api_key else anthropic.Anthropic()
         self._model = model or config.ANTHROPIC_MODEL
         self._max_tokens = max_tokens or config.ANTHROPIC_MAX_TOKENS
@@ -212,6 +603,58 @@ class AnthropicProvider:
             print(f"⚠️ consolidate_memory 失败({type(e).__name__}: {str(e)[:80]}) → 跳过整理")
             return {}
 
+    def curate_area(self, payload: dict) -> dict:
+        """Claude 记忆整理官（离线整理 pass，一次调用、纯文本、不读图）。
+
+        把探索产出的扁平 objects[] 组织成词典式结构：A 功能子区、B 上下文纠错(改名)、
+        C on/in/next_to 关系、D 对【代码检出的】离谱候选(共坐标/不可能尺寸)给合并/丢弃裁决。
+        【绝不输出/改动坐标】——子区 range 由代码从成员 abs_pose 算；只按给定 id 引用。
+        返回 {sub_areas,corrections,relations,merges,drops}；任何异常/超时/截断 → {} 当跳过。
+        """
+        try:
+            text = _build_curate_prompt(payload)
+            resp = self._client.messages.create(
+                model=self._model,
+                max_tokens=config.CURATE_MAX_TOKENS,
+                system=SYSTEM_CURATE,
+                messages=[{"role": "user", "content": text}],
+            )
+            if getattr(resp, "stop_reason", None) == "max_tokens":
+                print("⚠️ curate_area 输出被 max_tokens 截断 → JSON 不完整，跳过整理")
+                return {}
+            raw = "".join(b.text for b in resp.content if getattr(b, "type", None) == "text")
+            obj = _extract_json(raw or "")
+            return obj if isinstance(obj, dict) else {}
+        except Exception as e:  # noqa: BLE001
+            print(f"⚠️ curate_area 失败({type(e).__name__}: {str(e)[:80]}) → 跳过整理")
+            return {}
+
+    def plan_route(self, payload: dict) -> dict:
+        """Claude 语义路线规划官（读自己整理后的词典式地图，规划到目标的语义路线；不读图、不出坐标）。
+
+        输入：整理后地图(sub_areas+landmarks+relations+doors) + 起点 + 目标描述。
+        输出：有序语义 legs（每段 via=地标名/子区名 + manner=near/at/behind/left/right/front + note），
+        由 Qwen 逐段语义导航、代码把 via+manner 解析成坐标并 VFH 避障。**绝不输出坐标**。
+        返回 {legs:[...], goal_note}；任何失败/截断 → {}。
+        """
+        try:
+            text = _build_route_prompt(payload)
+            resp = self._client.messages.create(
+                model=self._model,
+                max_tokens=1500,
+                system=SYSTEM_ROUTE,
+                messages=[{"role": "user", "content": text}],
+            )
+            if getattr(resp, "stop_reason", None) == "max_tokens":
+                print("⚠️ plan_route 输出被 max_tokens 截断 → 跳过")
+                return {}
+            raw = "".join(b.text for b in resp.content if getattr(b, "type", None) == "text")
+            obj = _extract_json(raw or "")
+            return obj if isinstance(obj, dict) else {}
+        except Exception as e:  # noqa: BLE001
+            print(f"⚠️ plan_route 失败({type(e).__name__}: {str(e)[:80]}) → 跳过")
+            return {}
+
 
 SYSTEM_PLAN_COVERAGE = (
     "你是室内机器人的【探索覆盖调度官】。你【看不到图像】——只收到代码算出的紧凑符号地图："
@@ -277,6 +720,117 @@ def _build_consolidate_prompt(clusters: list) -> str:
              "对每个簇判定该位置是什么物体、给【一个】规范中文名(同簇名字矛盾也归并为一个)；"
              "整簇幻觉、或尺寸对类别明显离谱的 → 放 drop(size=null 不作删依据)。绝不输出坐标。只输出 JSON。"]
     return "\n".join(lines)
+
+
+SYSTEM_CURATE = (
+    "你是室内机器人的【记忆整理官】。你【看不到图像】——只收到代码算好的结构化物体清单"
+    "(每条含 id、name、aliases、世界坐标 abs_pose{x,y,z} 米、尺寸 size 米、定性 spatial、confidence)、"
+    "房间 boundary、doors，以及一份【代码检出的离谱候选 sanity_candidates】。\n"
+    "探索作者(Qwen)只做了逐帧命名+去重，产出是一份【扁平、带噪、无结构】的清单。你要把它组织成"
+    "『区域→子区→物体』的词典式记忆，让机器人之后能按功能区找到目标物体。\n"
+    "\n"
+    "★★ 最高红线：整理【绝不能让真实物体消失或被改错类】。宁可留一条低置信记录、也不要误删/误改。"
+    "机器人靠这张地图找东西，抹掉一个真柜子/真显示器，比留一点噪声危害大得多。★★\n"
+    "\n"
+    "做四件事（按下面三层判据）：\n"
+    "\n"
+    "【第1层 归并同物】只把【近乎重合=同一物被多视角记成多条】的合并成一条：\n"
+    "  · 两块『沙发』贴在同一处 → 合成 1 个沙发；\n"
+    "  · 『显示器』与『tv』(或 monitor)紧挨同一处 → 同一物异名，合并并统一成规范名『显示器』。\n"
+    "  判据：**只有位置近乎重合(代码已按 ≤合并半径 圈好并放进 sanity_candidates)才是同物**。\n"
+    "\n"
+    "【第2层 纠名(去牙，谨慎) + 同类成组】\n"
+    "  · 纠名【只在有内部证据时做】：①别名冲突——name 与它自己的 aliases 指向不同类(如 name=绿植 但 "
+    "aliases 含 柜子)，据其真实所在判定正确类；②尺寸对类别物理不可能。\n"
+    "  · ❌【严禁】仅因某物体孤立在一堆异类邻居中，就把它改成邻居的多数类！办公区里的一个柜子【仍是柜子】，"
+    "一排南墙柜子、隔断后的一片显示器都必须【原样保留】——按邻居改名会系统性抹掉少数类真物体、是最大的错。\n"
+    "  · 【紧邻同类成排=多个真实实例，不要合并】：三个柜子并排、一排四把椅子，是不同的物体，各自坐标不同、"
+    "各自都要能被找到。**把它们保留为独立物体，用第3层的 sub_area 归到同一子区**，绝不 merge 掉。\n"
+    "\n"
+    "【第3层 划分子区】把 object id 按空间位置+功能聚成若干子区(办公区/休息区/绿植角/门厅/储物区…)。"
+    "每个子区给：中文 label、英文 type、member_ids、一句话 summary。桌+椅→子办公区；沙发/柜子围一起→休息/中心区。"
+    "尽量让每个物体归属恰好一个子区；无法归类的 id 可不放。\n"
+    "\n"
+    "【关系 C】对明确成立的物体关系给 {subject_id, predicate, object_id}，predicate 只用 "
+    "on/in/next_to/under/above(如 显示器 on 办公桌)。\n"
+    "\n"
+    "【候选裁决 D】只针对 sanity_candidates 里的 id 表态，按 kind：\n"
+    "  · kind=name_dup / synonym_dup(一组近乎重合的同类物体)：判断是【同一物多视角】还是【多个真实实例】。"
+    "同一物→merges:{keep_id, drop_ids[], name, why}(synonym_dup 的 name 用统一规范名)；"
+    "确为多个真实实例→**不要合并**，可不表态(它们会各自留存并进子区)。\n"
+    "  · kind=alias_conflict(name 与自身别名跨类冲突)：这是【真物体被误标】——据证据判该处真类→corrections 改名。"
+    "**不要 drop**(删一个真物体比留点噪声危害大)；代码只允许改名不允许删它。\n"
+    "  · kind=impossible_size(尺寸物理不可能=多半几何噪声) → 可 drops:{id, why}，或改成尺寸合理的类。"
+    "【只有】impossible_size 候选可删。\n"
+    "  · 你【只能】对 sanity_candidates 里出现过的 id 做 merge；drop 只对 impossible_size 候选。改名(corrections)"
+    "应基于内部证据，【不要】凭邻居多数类翻转一个物体的类别(代码会拦截无据的类翻转)。\n"
+    "\n"
+    "硬性规则：\n"
+    "1. 【绝不输出或修改任何坐标】——子区 range 由代码从成员 abs_pose 算，你只给 member_ids。\n"
+    "2. 只用清单里【真实存在的 id】引用物体；你输出的每个 id 都必须在输入里出现过。\n"
+    "3. 跨真类绝不合并(桌/椅/显示器/柜子彼此不同物)；有疑就【保留】不删不改。\n"
+    "4. 只输出一个合法 JSON(不要代码块标记、不要任何解释)。\n"
+    "输出格式：{\"sub_areas\":[{\"label\":\"办公区\",\"type\":\"office\",\"member_ids\":[\"o1\",\"o2\"],"
+    "\"summary\":\"东侧办公桌+显示器+办公椅工位群\"}],"
+    "\"corrections\":[{\"id\":\"o5\",\"new_name\":\"显示器\",\"why\":\"name=tv与别名显示器同物,统一规范名\"}],"
+    "\"relations\":[{\"subject_id\":\"o3\",\"predicate\":\"on\",\"object_id\":\"o5\",\"why\":\"显示器立于桌面\"}],"
+    "\"merges\":[{\"keep_id\":\"o7\",\"drop_ids\":[\"o8\"],\"name\":\"显示器\",\"why\":\"显示器与tv近乎重合为同一屏\"}],"
+    "\"drops\":[{\"id\":\"o11\",\"why\":\"宽3.1m对办公桌物理不可能\"}]}"
+)
+
+
+def _build_curate_prompt(payload: dict) -> str:
+    return "\n".join([
+        f"区域 area: {payload.get('area')}  类型 type: {payload.get('type')}",
+        f"房间边界 boundary: {json.dumps(payload.get('boundary', {}), ensure_ascii=False)}",
+        f"门/开口 doors: {json.dumps(payload.get('doors', []), ensure_ascii=False)}",
+        "=== 物体清单(只能从这里选 id；abs_pose/size 仅供你判断，绝不回填或修改) ===",
+        json.dumps(payload.get("objects", []), ensure_ascii=False),
+        "=== 代码检出的离谱候选 sanity_candidates(只能对这里的 id 做 merge/drop) ===",
+        json.dumps(payload.get("sanity_candidates", []), ensure_ascii=False),
+        "请把物体聚成功能子区(A)、纠正误标(B)、给关系(C)、对上面候选给合并/丢弃裁决(D)。"
+        "绝不输出坐标。只输出一个 JSON。",
+    ])
+
+
+SYSTEM_ROUTE = (
+    "你是室内机器人的【语义路线规划官】。你【看不到图像】——只收到你之前整理好的词典式地图："
+    "功能子区(label/type/摘要/中心)、地标物体(名字+世界坐标)、物体关系、门/开口(带 label)，以及机器人起点与一个目标描述。\n"
+    "机器人底层用 VFH 反应式避障(会自己绕开障碍/贴墙滑行)，但它【只会朝一个个语义地标推进】——所以你要"
+    "把'从起点到目标'拆成一串【途经地标】，像给人指路：先到哪个地标附近、再到哪个、最后以什么方位靠近目标。\n"
+    "输出有序 legs，每段：\n"
+    "  · via：途经的【地标名(用地图里的物体名、子区 label、或门 label)】；\n"
+    "  · manner：到该地标的方位/方式，只用 near(附近)/at(到该处)/behind(后面)/left(左侧)/right(右侧)/front(前面)；\n"
+    "  · note：≤20字这段为什么这么走。\n"
+    "规则：\n"
+    "1. via 只能用地图里【真实出现的】子区 label、物体名、或【门 label】；不得编造。\n"
+    "2. 按空间从起点【由近及远】串起来。**当起点与目标分处隔断/子区两侧时，必须先以 `via=门label,"
+    " manner=at` 穿过那个开口（从哪个入口进哪个区要说清），再到门另一侧的地标**——别指望机器人自己"
+    "找缝，明确给出该走哪个门。最后一段以目标描述要求的 manner 收尾。\n"
+    "3. 【绝不输出任何坐标或距离】——via/manner 会由代码解析成坐标。\n"
+    "4. 只输出一个合法 JSON(不要代码块、不要解释)。\n"
+    "格式：{\"legs\":[{\"via\":\"沙发\",\"manner\":\"near\",\"note\":\"先到中央休息区\"},"
+    "{\"via\":\"红柜隔断北口\",\"manner\":\"at\",\"note\":\"从北口穿隔断进办公区\"},"
+    "{\"via\":\"东侧工位区\",\"manner\":\"at\",\"note\":\"进入工位区\"},"
+    "{\"via\":\"绿植\",\"manner\":\"left\",\"note\":\"到最东绿植左侧\"}],\"goal_note\":\"≤30字总体思路\"}"
+)
+
+
+def _build_route_prompt(payload: dict) -> str:
+    return "\n".join([
+        f"区域『{payload.get('area')}』类型 {payload.get('type')}。{payload.get('summary','')}",
+        f"机器人起点: {json.dumps(payload.get('start_pose', {}), ensure_ascii=False)}（朝东 +x）",
+        f"【目标】: {payload.get('target')}",
+        "=== 功能子区(label|type|中心x,y|摘要) ===",
+        json.dumps(payload.get("sub_areas", []), ensure_ascii=False),
+        "=== 地标物体(name|世界坐标 x,y) ===",
+        json.dumps(payload.get("landmarks", []), ensure_ascii=False),
+        "=== 门/开口(label 可直接作 via 目标；跨隔断/子区时用它穿过) ===",
+        json.dumps(payload.get("doors", []), ensure_ascii=False),
+        f"=== 物体关系 ===\n{json.dumps(payload.get('relations', []), ensure_ascii=False)}",
+        "规划一条【途经地标 via + 方位 manner】的语义路线到目标，跨隔断先经门 label 穿开口，"
+        "末段用目标要求的方位收尾。只用地图里真实的地标名/子区名/门 label，绝不输出坐标。只输出 JSON。",
+    ])
 
 
 def _build_plan_prompt(payload: dict) -> str:
