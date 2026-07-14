@@ -58,11 +58,22 @@ def _cat_match(rec, gt):
     return bool(_cand_names(rec) & gt_names)
 
 
-def score(area_path, gt_path):
-    with open(area_path, encoding="utf-8") as f:
-        area = json.load(f)
-    with open(gt_path, encoding="utf-8") as f:
-        gt = json.load(f)
+def _load(x):
+    """接受 dict（原样）或路径（读 json）。让打分可脱离磁盘、用于整理前后对比。"""
+    if isinstance(x, dict):
+        return x
+    with open(x, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def score_counts(area, gt):
+    """纯函数打分（不打印）：area/gt 可为 dict 或路径。
+
+    返回 {recall, n_obs, hits, misses, bonus, mislabels, halluc} —— hits/misses/bonus/mislabels/halluc
+    均为 (gt_or_rec, match) 元组列表，供上层做整理前后三方对比（召回/噪声/误标）。
+    """
+    area = _load(area)
+    gt = _load(gt)
     pos_tol = gt.get("pos_tol_m", 1.0)
     recorded = [o for o in area.get("objects", []) if isinstance(o, dict) and o.get("name")]
     gts = gt["objects"]
@@ -102,13 +113,24 @@ def score(area_path, gt_path):
         (mislabels if near else halluc).append((rec, near))
 
     recall = len(hits) / len(obs) if obs else 0.0
+    return {"recall": recall, "n_recorded": len(recorded), "n_obs": len(obs),
+            "hits": hits, "misses": misses, "bonus": bonus,
+            "mislabels": mislabels, "halluc": halluc}
+
+
+def score(area_path, gt_path):
+    r = score_counts(area_path, gt_path)
+    hits, misses, bonus = r["hits"], r["misses"], r["bonus"]
+    mislabels, halluc = r["mislabels"], r["halluc"]
+    n_obs, recorded_n, recall = r["n_obs"], r["n_recorded"], r["recall"]
+    pos_tol = _load(gt_path).get("pos_tol_m", 1.0)
 
     # ---- 报告 ----
     print(f"area   : {area_path}")
     print(f"GT     : {gt_path}   (pos_tol={pos_tol}m)")
-    print(f"记录物体: {len(recorded)}   observable 真值: {len(obs)}")
+    print(f"记录物体: {recorded_n}   observable 真值: {n_obs}")
     print("=" * 64)
-    print(f"召回率 = {len(hits)}/{len(obs)} = {recall*100:.1f}%   门槛 70%  →  "
+    print(f"召回率 = {len(hits)}/{n_obs} = {recall*100:.1f}%   门槛 70%  →  "
           + ("PASS ✅" if recall >= 0.70 else "FAIL ❌"))
     print("=" * 64)
     print(f"\n✓ 命中 observable 真值 ({len(hits)}):")

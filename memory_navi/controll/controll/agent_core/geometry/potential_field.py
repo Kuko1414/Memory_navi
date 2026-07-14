@@ -47,6 +47,49 @@ def scan_obs_quality(sectors, *, min_clear_m=OBS_MIN_CLEAR_M, cv_max=OBS_CV_MAX)
             "cv": round(cv, 2) if cv != math.inf else None, "uniform": uniform, "ok": ok}
 
 
+def apf_heading(pose, gx, gy, beams, *, k_att=1.0, eta=0.5, d0_m=1.0, rep_cap=1.5):
+    """APF 合力 → 世界航向(度)：执行模式【点到点】导航的方向核（纯数学，可脱 ROS 单测）。
+
+    执行模式是点到点问题（起点+航点+目标坐标皆已知），不该用探索/补全的岔口-VFH（"直路被堵就找最宽开口"
+    会把车导离目标）。APF：引力朝目标 + 斥力离障碍，合力方向逐小步开过去，天然穿缝（缝两侧斥力对消、
+    引力拉过去）。
+
+    斥力用【线性】falloff `eta·(1/d − 1/d0)`（不用 1/d²，否则贴障时斥力爆炸把车吓退），且对整簇障碍的
+    合斥力【封顶 rep_cap】——斥力只负责【侧向转开】，别盖过朝目标的前进引力(k_att)，才不会一见墙就掉头。
+
+    Args:
+        pose: {x, y, yaw_deg}（世界系；yaw=0 朝 +x，+yaw CCW）。
+        gx, gy: 目标世界坐标（引力指向它，单位向量 × k_att）。
+        beams: [[bearing_deg(体系,0=前/+左), dist_m], ...]（scan_rays；dist=-1/None/<=0 或 ≥d0_m 跳过）。
+        eta: 斥力增益。d0_m: 斥力影响半径。rep_cap: 合斥力幅值上限（相对 k_att）。
+
+    Returns:
+        合力世界航向(度)。无近障→朝目标；近障→航向侧偏离障；对称缝→侧向对消、朝目标穿中。
+    """
+    px, py = float(pose["x"]), float(pose["y"])
+    yaw = float(pose.get("yaw_deg", 0.0) or 0.0)
+    dgx, dgy = gx - px, gy - py
+    dg = math.hypot(dgx, dgy) or 1e-9
+    ax, ay = k_att * dgx / dg, k_att * dgy / dg               # 引力：朝目标单位向量
+    rx, ry = 0.0, 0.0
+    for b in beams or []:
+        try:
+            deg, d = float(b[0]), float(b[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if d <= 0 or d >= d0_m:                                # -1(无返回)/远障 → 无斥力
+            continue
+        wa = math.radians(yaw + deg)                           # 障碍世界方位
+        w = eta * (1.0 / d - 1.0 / d0_m)                       # 线性 falloff（近大远小、不爆炸）
+        rx -= w * math.cos(wa)                                 # 沿"离开障碍"方向（反障碍方位）
+        ry -= w * math.sin(wa)
+    rmag = math.hypot(rx, ry)
+    if rmag > rep_cap:                                         # 封顶：斥力只侧向转开、不盖过引力
+        rx *= rep_cap / rmag
+        ry *= rep_cap / rmag
+    return math.degrees(math.atan2(ay + ry, ax + rx))
+
+
 def _label_angle(label):
     """扇区标签 → 机体系角度(度)；无法解析返回 None。"""
     if label in _SECTOR_LABEL_ANG:
