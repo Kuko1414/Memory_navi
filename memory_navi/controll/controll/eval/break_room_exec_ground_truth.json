@@ -1,0 +1,25 @@
+{
+  "_note": "执行模式初期实验答案 key（break_room 理想图上的两目标顺序任务）。坐标=GT 真值(米)。完成阀值为【安全兼容】：安全/导航层不可绕过(front_block 0.4m / clearance 0.4m / safety 0.15m 硬停)，物理到不了 0.1m，故到达以【表面距离 ≤ arrival_surface_tol】判，并记录实测最小表面距离作连续指标。",
+
+  "task": {
+    "instruction_to_robot": "从起始休息区出发，先到红柜后办公区最靠东北的那株绿植旁，再到西侧办公簇最西南的那株绿植旁；每到一处尽量靠近并回报。动作类比：从 A 区拿东西送到 B 区。",
+    "start": {"x": -0.5, "y": -1.0, "yaw_deg": 0.0}
+  },
+
+  "targets": [
+    {"name": "绿植", "x": 6.23, "y": 1.42, "sub_area": "红柜后办公区", "note": "远东北绿植(目标1)"},
+    {"name": "绿植", "x": -5.78, "y": -2.17, "sub_area": "西侧办公簇", "note": "远西南绿植(目标2)"}
+  ],
+
+  "scoring": {
+    "arrival_surface_tol_m": 0.45,
+    "car_half_m": 0.16,
+    "obj_radius_m": 0.20,
+    "arrival_rule": "表面距离 = hypot(car,obj) - car_half - obj_radius ≤ arrival_surface_tol 即到达；同时报实测最小表面距离(连续指标，不因到不了 0.1m 而误判)。",
+    "require_qwen_summary": true,
+    "require_supervisor_report": true,
+    "target_synonyms": {"绿植": ["盆栽", "potted plant", "plant"]},
+    "hallucination_blacklist": ["人", "person", "电视", "TV", "书架", "bookshelf", "床", "bed", "冰箱", "refrigerator"],
+    "pass_all": "两目标均到达(表面距离达阀值) + Qwen 输出总结 + supervisor 回报 + 无幻觉 → 通过；碰撞次数/耗时作连续指标，不作硬门(初期实验)。"
+  }
+}

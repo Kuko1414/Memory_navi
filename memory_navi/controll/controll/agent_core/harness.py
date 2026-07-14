@@ -15,6 +15,7 @@ import re
 
 from agent_core.executor import Executor
 from agent_core.image_utils import to_openai_image_url
+from agent_core.perception import roi_candidates as rc
 
 PRIMITIVES = ("look", "move", "turn_left", "turn_right", "report")
 
@@ -321,7 +322,17 @@ def _parse_box_judgments(raw: str, box_ids: list) -> dict:
     return parsed
 
 
+def filter_box_judgments_by_allowed_names(parsed: dict, allowed_names: list | None) -> dict:
+    """Force box judgments into a task-specific class set.
+
+    This is used for south-wall/kitchen frames: the prompt asks the model to pick
+    from a small set, and this pure post-filter makes that contract hard.
+    """
+    return rc.filter_judgments_by_allowed_names(parsed, allowed_names)
+
+
 def name_boxes(ex: Executor, look, boxes: list, *, name_hints: list = None,
+               allowed_names: list = None, context_hint: str = "",
                max_tokens: int = 1200) -> dict:
     """混合标注 Qwen 半：整图 + YOLO 编号框，一次调用批量判每框【完整度 + 命名/弃权】。
 
@@ -353,8 +364,18 @@ def name_boxes(ex: Executor, look, boxes: list, *, name_hints: list = None,
     if name_hints:
         name_line = ("本区域已知物体（若框住的是它们，请沿用这些名称，不要另起名）："
                      + "、".join(str(n) for n in name_hints) + "。\n")
+    allowed_line = ""
+    allowed_set = None
+    if allowed_names:
+        allowed_set = {str(n).strip() for n in allowed_names if str(n).strip()}
+        allowed_line = (
+            f"{context_hint or '当前帧有特定语义先验'}：每个框只能在 "
+            + " / ".join(sorted(allowed_set))
+            + " / 不是物体 中选择。若都不像，必须 keep=false、name=null。\n"
+        )
     user = (
         f"{name_line}"
+        f"{allowed_line}"
         f"画面里有 {len(box_ids)} 个带编号的蓝框（编号 {sorted(box_ids)}）。\n"
         "逐框判断完整度并命名/弃权，boxes 覆盖每个编号（JSON）。"
     )
@@ -372,7 +393,8 @@ def name_boxes(ex: Executor, look, boxes: list, *, name_hints: list = None,
         raw = (resp.choices[0].message.content or "").strip()
         if raw.endswith("}"):
             break
-    return _parse_box_judgments(raw, box_ids)
+    parsed = _parse_box_judgments(raw, box_ids)
+    return filter_box_judgments_by_allowed_names(parsed, sorted(allowed_set) if allowed_set else None)
 
 
 def inspect_and_report(ex: Executor, *, area_hint: str = "", max_tokens: int = 1000,

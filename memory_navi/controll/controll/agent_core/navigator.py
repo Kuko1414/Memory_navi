@@ -156,6 +156,8 @@ def geo_goto_around(
     slide_deg: float = 90.0,
     backoff_m: float = 0.35,
     max_stuck: int = 4,
+    confine_legs: int = 5,
+    confine_r: float = 0.6,
 ) -> dict:
     """去点 + 撞墙【反应式分段绕行】（贴墙滑行 bug-algorithm，含解钉退避）。
 
@@ -163,19 +165,30 @@ def geo_goto_around(
     被 safety 锁死)，再转向开阔侧≈slide_deg 贴墙挪 wall_step，回顶重新正对目标；目标方向一通就续直冲。
     沿墙手性按 scan 开阔度选定后**保持不翻面**(翻面会原地振荡)；以**位置冻结**(非距目标变化)判卡死。
 
-    返回 {arrived, dist_m, pose, steps, status}；status ∈ arrived|stuck|max_legs。
+    振荡早停：连续 confine_legs 腿一直在动却困在 confine_r 小圈里（目标落沙发/桌腿间→靠近-弹开-滑-靠近
+    反复排斥）→ 立即放弃，status="no_progress"（正当绕墙 detour 净位移会持续增大，不会误判）。
+
+    返回 {arrived, dist_m, pose, steps, status}；status ∈ arrived|stuck|no_progress|max_legs。
     """
     steps = []
     side = None              # 'left'/'right' 沿墙手性，撞墙时按 scan 选定后保持
     prev_xy = None
     stuck = 0
     status = "max_legs"
+    pos_hist = []            # 近几腿真值位姿：查"一直在动却困在小圈"(弹跳)，区别于正当绕墙(净位移增大)
     for leg in range(max_legs):
         p = _pose(ex)
         dist = math.hypot(tx - p["x"], ty - p["y"])
         if dist <= tol_m:
             status = "arrived"
             break
+        # 振荡早停：连续 confine_legs 腿仍困在 confine_r 内(沙发/桌腿间反复排斥) → 放弃(不再枉弹)
+        pos_hist.append((p["x"], p["y"]))
+        if len(pos_hist) > confine_legs:
+            back = pos_hist[-(confine_legs + 1)]
+            if math.hypot(p["x"] - back[0], p["y"] - back[1]) < confine_r:
+                status = "no_progress"
+                break
         # 卡死检测：位置几乎不动(被钉在墙上) → 放弃（detour 中位置一直在变，不会误判）
         if prev_xy is not None:
             moved_xy = math.hypot(p["x"] - prev_xy[0], p["y"] - prev_xy[1])
@@ -255,6 +268,62 @@ def _scan_sectors(ex, sectors: int = 12) -> dict:
     return out
 
 
+def scan_openings(ex, *, sectors: int = 12, pass_min_m: float = 0.7,
+                  fwd_halfwidth_deg: float = 100.0) -> list:
+    """单帧 scan → 前向【离散可通行开口】列表（把可通行角聚成簇，供上层判 岔口/走廊/死胡同）。
+
+    复用 _scan_sectors 拿 {角度(体系,0=前/+左): 最近障碍距离|None}；只取前向半圆
+    (|归一化角| <= fwd_halfwidth_deg)，按角度排序；连续 dist>=pass_min_m 的扇区聚成一个开口，
+    被 <pass_min_m 或无返回(None) 的扇区隔断即分簇。
+    返回按 center_deg 排序的 [{center_deg, width_deg, min_clear_m, angles:[...]}]（角度均已归一化）。
+    - len==0：死胡同（前向无可通行开口）；==1：单走廊；>=2：岔口（丁字/十字）。
+    """
+    sc = _scan_sectors(ex, sectors)
+    if not sc:
+        return []
+    bin_deg = 360.0 / max(1, sectors)
+    fwd = sorted(
+        (_norm_deg(a), d) for a, d in sc.items()
+        if abs(_norm_deg(a)) <= fwd_halfwidth_deg
+    )
+    groups, cur = [], []
+    for a, d in fwd:
+        if d is not None and d >= pass_min_m:
+            cur.append((a, d))
+        elif cur:
+            groups.append(cur)
+            cur = []
+    if cur:
+        groups.append(cur)
+    out = []
+    for grp in groups:
+        angs = [a for a, _ in grp]
+        ds = [d for _, d in grp]
+        out.append({
+            "center_deg": round(sum(angs) / len(angs), 1),
+            "width_deg": round(max(angs) - min(angs) + bin_deg, 1),
+            "min_clear_m": round(min(ds), 2),
+            "angles": angs,
+        })
+    out.sort(key=lambda o: o["center_deg"])
+    return out
+
+
+def opening_for_bearing(openings, des_robot_deg, tol_deg=15.0):
+    """目标方位(体系)是否落在某开口的角度覆盖内(两端各放宽半个 bin)；是则返回该开口，否则 None。"""
+    for o in openings:
+        if min(o["angles"]) - tol_deg <= des_robot_deg <= max(o["angles"]) + tol_deg:
+            return o
+    return None
+
+
+def nearest_opening(openings, des_robot_deg):
+    """离目标方位最近的开口（几何兜底）；openings 为空返回 None。"""
+    if not openings:
+        return None
+    return min(openings, key=lambda o: abs(_norm_deg(o["center_deg"] - des_robot_deg)))
+
+
 def geo_step_open(
     ex,
     desired_bearing_deg: float,
@@ -306,6 +375,82 @@ def geo_step_open(
     return {"moved_m": round(moved, 2), "status": status, "pose": p2,
             "chosen_bearing": round(chosen, 0), "clear_m": round(clear or 0, 2),
             "passable": passable, "desired_robot": round(des_robot, 0)}
+
+
+def _fwd_clear(beams, des_robot_deg, halfwidth_deg=25.0):
+    """朝 des_robot 方向(体系)±halfwidth 内的【最近障碍距离】(米)；无有效束返回 None。
+
+    供 apf_goto 按"前向最近障 − clearance"封顶步长，别一步冲进 safety 刹停带。
+    beams: scan_rays 的 [[bearing_deg(体系), dist_m], ...]（-1/None/非正跳过）。
+    """
+    best = None
+    for b in beams or []:
+        try:
+            deg, d = float(b[0]), float(b[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if d <= 0:
+            continue
+        if abs(_norm_deg(deg - des_robot_deg)) <= halfwidth_deg and (best is None or d < best):
+            best = d
+    return best
+
+
+def apf_goto(ex, gx, gy, *, tol_m=0.4, step_m=0.6, max_steps=30,
+             d0_m=1.0, clearance_m=0.35, k_att=1.0, eta=0.5, beams=90, max_stuck=4):
+    """APF【点到点】导航：引力朝目标 + 斥力离障碍 → 合力航向，逐小步开过去（执行模式用）。
+
+    每步：读活体 scan_rays → potential_field.apf_heading 求合力世界航向 → 面向它 → 前向最近障封顶步长后 move。
+    天然穿缝、不把车导离目标（区别于岔口-VFH）。连续位置冻结(<0.1m ×max_stuck) → geo_goto_around 反应式
+    脱困（逃 APF 局部极小）。safety_stop 只是本步停、下轮重规划。不碰 geo_step_open/geo_goto_around 本体。
+
+    返回 {arrived, dist_m, pose, steps, status}；status ∈ arrived|arrived_around|stuck|max_steps。
+    """
+    from agent_core.geometry import potential_field as pf
+    prev_xy, stuck, logs = None, 0, []
+    for i in range(max_steps):
+        p = _pose(ex)
+        dist = math.hypot(gx - p["x"], gy - p["y"])
+        if dist <= tol_m:
+            return {"arrived": True, "dist_m": round(dist, 3), "pose": p, "steps": logs,
+                    "status": "arrived"}
+        if prev_xy is not None:                               # 卡死检测：位置冻结 → 反应式脱困
+            if math.hypot(p["x"] - prev_xy[0], p["y"] - prev_xy[1]) > 0.1:
+                stuck = 0
+            else:
+                stuck += 1
+                if stuck >= max_stuck:
+                    ga = geo_goto_around(ex, gx, gy, tol_m=tol_m, max_legs=8)
+                    pf2 = _pose(ex)
+                    dd = math.hypot(gx - pf2["x"], gy - pf2["y"])
+                    st = "arrived_around" if ga.get("status") == "arrived" else "stuck"
+                    return {"arrived": dd <= tol_m, "dist_m": round(dd, 3), "pose": pf2,
+                            "steps": logs, "status": st}
+        prev_xy = (p["x"], p["y"])
+        try:
+            sr = json.loads(ex.ros.call("scan_rays", {"max_beams": beams}).text)
+            blist = sr.get("beams") or []
+        except (ValueError, TypeError):
+            blist = []
+        heading = pf.apf_heading(p, gx, gy, blist, k_att=k_att, eta=eta, d0_m=d0_m)
+        des_robot = _norm_deg(heading - p["yaw_deg"])
+        fclear = _fwd_clear(blist, des_robot)                 # 沿【将走方向】(当前体系)最近障 → 封顶步长
+        if abs(des_robot) > 1.0:
+            tool = "turn_left_deg" if des_robot > 0 else "turn_right_deg"
+            ex.ros.call(tool, {"degrees": round(abs(des_robot), 1)})
+        cap = step_m if fclear is None else max(0.15, fclear - clearance_m)
+        go = max(0.0, min(step_m, dist, cap))
+        moved, status = 0.0, "no_room"
+        if go >= 0.15:
+            mv = json.loads(ex.ros.call("move", {"distance_m": round(go, 2)}).text)
+            moved = mv.get("traveled_m", 0) or 0.0
+            status = "safety_stop" if mv.get("status") == "safety_stop" else "moved"
+        logs.append(f"{i}:h={round(heading)}deg d={round(dist, 2)} go={round(go, 2)} "
+                    f"moved={round(moved, 2)} {status}")
+    p = _pose(ex)
+    dist = math.hypot(gx - p["x"], gy - p["y"])
+    return {"arrived": dist <= tol_m, "dist_m": round(dist, 3), "pose": p, "steps": logs,
+            "status": "max_steps"}
 
 
 def geo_route(ex, waypoints, **kw) -> dict:
