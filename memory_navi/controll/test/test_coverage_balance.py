@@ -53,6 +53,37 @@ def test_no_bbox_returns_first():
     assert ep._balance_filter(cands, None, []) == cands
 
 
+def test_grid_balance_uses_fixed_origin_not_shifted_discovered_bbox():
+    """Many west observations must make the next grid target come from the east."""
+    pose = {"x": -4.0, "y": 0.0}
+    vantages = [(-5.0, 1.0), (-4.5, 2.0), (-5.0, -2.0), (-4.0, -1.5)]
+    targets = [(-5.5, 1.5), (-5.5, -1.5), (2.0, 1.5), (2.0, -1.5)]
+
+    tx, _ty = ep._balanced_grid_target(targets, pose, vantages, origin=(0.0, 0.0))
+
+    assert tx > 0.0
+
+
+def test_grid_balance_counts_vantages_and_then_rotates_quadrants():
+    pose = {"x": 0.0, "y": 0.0}
+    targets = [(-2.0, 2.0), (2.0, 2.0), (-2.0, -2.0), (2.0, -2.0)]
+    vantages = [(2.0, 2.0), (-2.0, 2.0), (2.0, -2.0)]
+
+    target = ep._balanced_grid_target(targets, pose, vantages, origin=(0.0, 0.0))
+
+    assert target == (-2.0, -2.0)
+
+
+def test_observed_frontier_is_not_selected_again_after_viewpoint_retreat():
+    cands = [_c("covered", 2.8, -1.4), _c("new", 4.2, -1.4)]
+    # The requested target is recorded even though the safe physical station was elsewhere.
+    vantage_xys = [(2.8, -1.4), (1.1, -0.1)]
+
+    left = ep._exclude_observed_candidates(cands, vantage_xys)
+
+    assert [candidate["id"] for candidate in left] == ["new"]
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

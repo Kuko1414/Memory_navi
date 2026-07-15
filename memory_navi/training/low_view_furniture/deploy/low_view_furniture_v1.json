@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "model_version": "low_view_furniture_v1",
+  "weights": "/home/kuko/Kuko1414/models/low_view_furniture/low_view_furniture_v1/best.pt",
+  "weights_sha256": "f204995df2995f7acc2ea1f0d3c6447bbb3f28e5f29baf3c8b2b1a7dfc53dd24",
+  "imgsz": 640,
+  "candidate_conf": 0.05,
+  "class_conf_thresholds": {
+    "cabinet": 0.3994,
+    "desk": 0.4404,
+    "office_chair": 0.2312,
+    "sofa": 0.5566,
+    "potted_plant": 0.1962
+  },
+  "candidate_only": [
+    "monitor",
+    "kitchen_counter",
+    "sink"
+  ],
+  "calibration": {
+    "target_precision": 0.9,
+    "supported_test_micro_precision": 0.9635,
+    "supported_test_micro_recall": 0.8408,
+    "negative_test_frames": 24,
+    "negative_test_frames_with_confirmed": 0
+  }
+}

@@ -6,6 +6,7 @@ without installing YOLO.
 """
 from __future__ import annotations
 
+import json
 import os
 import time
 from pathlib import Path
@@ -56,6 +57,49 @@ CANONICAL_NAME_BY_CLASS = {
 DOOR_LABELS = {"door"}
 
 
+def load_inference_profile(profile_path: str | os.PathLike) -> dict:
+    """Load and validate a versioned detector publication profile.
+
+    The profile deliberately keeps model selection and publication thresholds outside
+    the exploration code. Switching backends is therefore an environment/config
+    change, and labels that failed held-out precision can remain visible in raw
+    detections without being published into memory.
+    """
+    path = Path(profile_path).expanduser().resolve()
+    with path.open(encoding="utf-8") as stream:
+        profile = json.load(stream)
+    if not isinstance(profile, dict):
+        raise ValueError("inference profile must be a JSON object")
+
+    required = {"model_version", "weights", "class_conf_thresholds"}
+    missing = sorted(required - set(profile))
+    if missing:
+        raise ValueError(f"inference profile missing keys: {', '.join(missing)}")
+
+    thresholds = profile["class_conf_thresholds"]
+    if not isinstance(thresholds, dict) or not thresholds:
+        raise ValueError("class_conf_thresholds must be a non-empty JSON object")
+    normalized_thresholds = {}
+    for label, threshold in thresholds.items():
+        value = float(threshold)
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(f"invalid confidence threshold for {label}: {value}")
+        normalized_thresholds[normalize_label(label)] = value
+
+    profile["profile_path"] = str(path)
+    profile["weights"] = str(Path(profile["weights"]).expanduser().resolve())
+    profile["model_version"] = str(profile["model_version"])
+    profile["class_conf_thresholds"] = normalized_thresholds
+    profile["candidate_only"] = [
+        normalize_label(label) for label in profile.get("candidate_only", [])
+    ]
+    candidate_conf = float(profile.get("candidate_conf", 0.05))
+    if not 0.0 <= candidate_conf <= 1.0:
+        raise ValueError("candidate_conf must be in [0, 1]")
+    profile["candidate_conf"] = candidate_conf
+    return profile
+
+
 def normalize_label(label: str) -> str:
     """Normalize detector labels for mapping and comparison."""
     return " ".join(str(label or "").strip().lower().replace("_", " ").split())
@@ -102,6 +146,76 @@ def bbox_xyxy_to_center(bbox_xyxy, width: int, height: int, scale: int = 1000) -
     return [int(round(roi["x"] + roi["w"] / 2)), int(round(roi["y"] + roi["h"] / 2))]
 
 
+def mask_polygon_to_depth_probe_roi(
+    polygon,
+    width: int,
+    height: int,
+    *,
+    scale: int = 1000,
+    scanlines: int = 15,
+    min_probe_px: float = 5.0,
+    max_probe_px: float = 12.0,
+) -> dict | None:
+    """Return a small normalized ROI guaranteed to sit inside a mask polygon.
+
+    A segmentation bbox often includes floor, background, or a neighbouring object.
+    Sampling the full bbox (especially its nearest depth) can therefore project a valid
+    detection to the wrong world position.  This helper finds the widest polygon
+    interior interval across several scanlines and places a small depth probe there.
+    """
+    if (
+        width <= 0
+        or height <= 0
+        or scanlines <= 0
+        or min_probe_px <= 0
+        or max_probe_px < min_probe_px
+    ):
+        return None
+    try:
+        points = [(float(point[0]), float(point[1])) for point in polygon]
+    except (TypeError, ValueError, IndexError):
+        return None
+    if len(points) < 3:
+        return None
+    ys = [point[1] for point in points]
+    ymin, ymax = min(ys), max(ys)
+    if ymax <= ymin:
+        return None
+
+    best = None
+    for index in range(scanlines):
+        y = ymin + (index + 0.5) / scanlines * (ymax - ymin)
+        intersections = []
+        for start, end in zip(points, points[1:] + points[:1]):
+            x1, y1 = start
+            x2, y2 = end
+            if (y1 <= y < y2) or (y2 <= y < y1):
+                intersections.append(x1 + (y - y1) * (x2 - x1) / (y2 - y1))
+        intersections.sort()
+        for left, right in zip(intersections[::2], intersections[1::2]):
+            span = right - left
+            if span > 0 and (best is None or span > best[0]):
+                best = (span, (left + right) / 2.0, y)
+    if best is None:
+        return None
+
+    span, center_x, center_y = best
+    probe_width = max(min_probe_px, min(max_probe_px, span * 0.25))
+    probe_height = max(min_probe_px, min(max_probe_px, (ymax - ymin) * 0.08))
+    x1 = clamp(center_x - probe_width / 2.0, 0.0, float(width))
+    x2 = clamp(center_x + probe_width / 2.0, 0.0, float(width))
+    y1 = clamp(center_y - probe_height / 2.0, 0.0, float(height))
+    y2 = clamp(center_y + probe_height / 2.0, 0.0, float(height))
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return {
+        "x": int(round(x1 / width * scale)),
+        "y": int(round(y1 / height * scale)),
+        "w": max(1, int(round((x2 - x1) / width * scale))),
+        "h": max(1, int(round((y2 - y1) / height * scale))),
+    }
+
+
 def raw_detection_to_object(
     det: dict,
     width: int,
@@ -128,16 +242,20 @@ def raw_detection_to_object(
     obj = {
         "name": name,
         "confidence": round(conf, 4),
+        "detector_score": round(conf, 4),
         "roi": bbox_xyxy_to_roi(bbox, width, height),
         "bbox_center": bbox_xyxy_to_center(bbox, width, height),
         "verified_by": [source],
         "detector_label": label,
         "detector_source": source,
+        "model_version": source,
     }
     if is_door_label(label):
         obj["is_door"] = True
     if det.get("mask_area_px") is not None:
         obj["mask_area_px"] = int(det["mask_area_px"])
+    if det.get("mask_polygon") is not None:
+        obj["mask_polygon"] = det["mask_polygon"]
     return obj
 
 
@@ -149,10 +267,67 @@ def normalize_detections(
     conf_thres: float = DEFAULT_CONF,
     include_doors: bool = False,
     source: str = "yoloe",
+    class_conf_thresholds: dict[str, float] | None = None,
+    disabled_labels: set[str] | None = None,
 ) -> list[dict]:
     """Convert a list of raw detections to memory-compatible objects."""
+    thresholds = {
+        normalize_label(label): float(threshold)
+        for label, threshold in (class_conf_thresholds or {}).items()
+    }
+    disabled = {normalize_label(label) for label in (disabled_labels or set())}
     out = []
     for det in detections or []:
+        label = normalize_label(det.get("label") or det.get("class_name") or "")
+        if label in disabled:
+            continue
+        obj = raw_detection_to_object(
+            det,
+            width,
+            height,
+            conf_thres=thresholds.get(label, conf_thres),
+            include_doors=include_doors,
+            source=source,
+        )
+        if obj is not None:
+            out.append(obj)
+    return out
+
+
+def partition_detections(
+    detections: list[dict],
+    width: int,
+    height: int,
+    *,
+    conf_thres: float = DEFAULT_CONF,
+    include_doors: bool = False,
+    source: str = "yoloe",
+    class_conf_thresholds: dict[str, float] | None = None,
+    candidate_only_labels: set[str] | None = None,
+) -> tuple[list[dict], list[dict]]:
+    """Split detections into publishable objects and non-navigable candidates.
+
+    Candidate-only classes and known detections below their class publish threshold
+    remain available for multi-view/Qwen review. They are never mixed into the
+    confirmed ``objects`` list.
+    """
+    thresholds = {
+        normalize_label(label): float(threshold)
+        for label, threshold in (class_conf_thresholds or {}).items()
+    }
+    candidate_only = {
+        normalize_label(label) for label in (candidate_only_labels or set())
+    }
+    confirmed: list[dict] = []
+    candidates: list[dict] = []
+    for det in detections or []:
+        label = normalize_label(det.get("label") or det.get("class_name") or "")
+        score = float(det.get("confidence", det.get("conf", 0.0)) or 0.0)
+        if score < conf_thres:
+            continue
+        publish_threshold = thresholds.get(label, conf_thres)
+        is_candidate_only = label in candidate_only
+        below_publish_threshold = score < publish_threshold
         obj = raw_detection_to_object(
             det,
             width,
@@ -161,9 +336,20 @@ def normalize_detections(
             include_doors=include_doors,
             source=source,
         )
-        if obj is not None:
-            out.append(obj)
-    return out
+        if obj is None:
+            continue
+        if is_candidate_only or below_publish_threshold:
+            obj["memory_status"] = "candidate"
+            obj["candidate_reason"] = (
+                "class_candidate_only" if is_candidate_only else "below_publish_threshold"
+            )
+            obj["publish_threshold"] = round(float(publish_threshold), 4)
+            candidates.append(obj)
+        else:
+            obj["memory_status"] = "confirmed"
+            obj["publish_threshold"] = round(float(publish_threshold), 4)
+            confirmed.append(obj)
+    return confirmed, candidates
 
 
 def raw_detections_to_boxes(
@@ -259,7 +445,65 @@ def _names_get(names, cls_id: int) -> str:
     return str(cls_id)
 
 
-def result_to_raw_detections(result) -> list[dict]:
+def bbox_iou(first, second) -> float:
+    """Return intersection-over-union for two pixel ``xyxy`` boxes."""
+    x1 = max(float(first[0]), float(second[0]))
+    y1 = max(float(first[1]), float(second[1]))
+    x2 = min(float(first[2]), float(second[2]))
+    y2 = min(float(first[3]), float(second[3]))
+    intersection = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+    first_area = max(0.0, float(first[2]) - float(first[0])) * max(
+        0.0, float(first[3]) - float(first[1])
+    )
+    second_area = max(0.0, float(second[2]) - float(second[0])) * max(
+        0.0, float(second[3]) - float(second[1])
+    )
+    union = first_area + second_area - intersection
+    return intersection / union if union > 0.0 else 0.0
+
+
+def deduplicate_raw_detections(
+    detections: list[dict],
+    *,
+    iou_threshold: float = 0.85,
+) -> list[dict]:
+    """Suppress near-identical same-class YOLO26 candidates before memory insertion.
+
+    Different labels are deliberately preserved so the downstream semantic gate can
+    resolve a genuine class conflict.  This only removes the one-to-one/one-to-many head
+    duplicates observed with almost identical boxes and masks.
+    """
+    if not 0.0 <= iou_threshold <= 1.0:
+        raise ValueError("iou_threshold must be in [0, 1]")
+    ordered = sorted(
+        detections or [],
+        key=lambda item: float(item.get("confidence", item.get("conf", 0.0)) or 0.0),
+        reverse=True,
+    )
+    kept: list[dict] = []
+    for detection in ordered:
+        label = normalize_label(
+            detection.get("label") or detection.get("class_name") or ""
+        )
+        bbox = detection.get("bbox_xyxy") or detection.get("xyxy")
+        if not (isinstance(bbox, (list, tuple)) and len(bbox) == 4):
+            kept.append(detection)
+            continue
+        duplicate = any(
+            label
+            == normalize_label(existing.get("label") or existing.get("class_name") or "")
+            and bbox_iou(bbox, existing.get("bbox_xyxy") or existing.get("xyxy"))
+            >= iou_threshold
+            for existing in kept
+            if isinstance(existing.get("bbox_xyxy") or existing.get("xyxy"), (list, tuple))
+            and len(existing.get("bbox_xyxy") or existing.get("xyxy")) == 4
+        )
+        if not duplicate:
+            kept.append(detection)
+    return kept
+
+
+def result_to_raw_detections(result, *, dedup_iou: float | None = 0.85) -> list[dict]:
     """Convert an Ultralytics Results object to small JSON-safe raw detections."""
     boxes = getattr(result, "boxes", None)
     if boxes is None:
@@ -270,12 +514,17 @@ def result_to_raw_detections(result) -> list[dict]:
     names = getattr(result, "names", None) or {}
     masks = getattr(result, "masks", None)
     mask_areas = []
+    mask_polygons = []
     if masks is not None and getattr(masks, "data", None) is not None:
         for m in _to_list(masks.data):
             try:
                 mask_areas.append(int(sum(sum(row) for row in m)))
             except TypeError:
                 mask_areas.append(None)
+        for polygon in getattr(masks, "xy", []) or []:
+            mask_polygons.append(
+                [[round(float(x), 2), round(float(y), 2)] for x, y in _to_list(polygon)]
+            )
 
     detections = []
     for i, bbox in enumerate(xyxys):
@@ -287,8 +536,12 @@ def result_to_raw_detections(result) -> list[dict]:
         }
         if i < len(mask_areas) and mask_areas[i] is not None:
             det["mask_area_px"] = mask_areas[i]
+        if i < len(mask_polygons):
+            det["mask_polygon"] = mask_polygons[i]
         detections.append(det)
-    return detections
+    if dedup_iou is None:
+        return detections
+    return deduplicate_raw_detections(detections, iou_threshold=dedup_iou)
 
 
 def load_model(model_name: str = DEFAULT_MODEL, text_classes: list[str] = None):
@@ -317,6 +570,10 @@ def predict_image(
     conf: float = DEFAULT_CONF,
     imgsz: int | None = None,
     include_doors: bool = False,
+    source: str = "yoloe",
+    class_conf_thresholds: dict[str, float] | None = None,
+    disabled_labels: set[str] | None = None,
+    dedup_iou: float | None = 0.85,
 ) -> dict:
     """Run one image through a loaded model and return raw + normalized detections."""
     from PIL import Image
@@ -331,8 +588,17 @@ def predict_image(
     results = model.predict(image_path, **kwargs)
     elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 2)
     result = results[0]
-    raw = result_to_raw_detections(result)
-    objects = normalize_detections(raw, width, height, conf_thres=conf, include_doors=include_doors)
+    raw = result_to_raw_detections(result, dedup_iou=dedup_iou)
+    objects, candidate_objects = partition_detections(
+        raw,
+        width,
+        height,
+        conf_thres=conf,
+        include_doors=include_doors,
+        source=source,
+        class_conf_thresholds=class_conf_thresholds,
+        candidate_only_labels=disabled_labels,
+    )
     return {
         "image": image_path,
         "width": width,
@@ -340,6 +606,6 @@ def predict_image(
         "elapsed_ms": elapsed_ms,
         "raw_detections": raw,
         "objects": objects,
+        "candidate_objects": candidate_objects,
         "_result": result,
     }
-

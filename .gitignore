@@ -16,6 +16,11 @@ paper/*.pdf
 *.safetensors
 mobileclip2_b.ts
 *.ts.pt
+
+# Local training data, experiment runs, and self-hosted annotation tooling.
+/datasets/
+/runs/
+/.tools/
 Report/hybrid_review*/imgs_*/
 Report/dual_review/imgs_*/
 memory_navi/ros-mcp-server/examples/*/images/*.gif
